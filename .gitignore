@@ -1,0 +1,64 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 打包产物 ──
+build/
+dist/
+*.spec
+_stage_*/
+
+# ── 发布包（构建生成，不入库） ──
+ZeroFall_v*.zip
+SHA256SUMS.txt
+
+# ── 图标生成中间产物 ──
+icon_preview.png
+icon_16.png
+icon_32.png
+icon_48.png
+icon_64.png
+icon_small_check.png
+
+# ── 运行时数据，绝对不要提交 ──
+# 里面可能有 API Key、快照、日志、脱敏前的配置
+logs/
+zerofall_config.json
+secrets.json
+model_memory.json
+*.log
+.environment_state.json
+snapshot_*.zip
+snapshot_*.zip.enc
+snapshot_*.meta.json
+*_API_KEY.txt
+
+# ── 备份文件（我改代码时留的，不该进仓库） ──
+*.bak
+*.bak_*
+*.bak-*
+
+# ── 编辑器 ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 编辑脚本留下的临时/备份目录（开源时不该带上去）
+_backup_*/
+_stage_*/
+*.bak
+*.orig
+
+# 快照本体（含本机数据）
+snapshots/
+# 可执行文件不进版本库
+*.exe
+# 图标备份
+*.ico.bak
+# 云端清理计划（本机数据）
+cloud_prune_plan.json
