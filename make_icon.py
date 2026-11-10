@@ -108,6 +108,8 @@ def build():
                       c_from=ACCENT, c_to=ACCENT2)
 
     # 内弧：与外环错开半圈，做出"轨道"层次（纯线条式科技感的关键）
+    # 大尺寸靠它撑起层次感；小尺寸由 build_simple() 单独绘制，同样保留双环，
+    # 保证托盘 / 任务栏 / 桌面看到的是同一个图标。
     inner_r = int(W * 0.176)
     inner_w = int(W * 0.026)
     draw_arc_gradient(img, cx, cy, inner_r, inner_w,
