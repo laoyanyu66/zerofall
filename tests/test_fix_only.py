@@ -15,6 +15,29 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from modules.master import (extract_file_hints, snapshot_py_hashes,
                             diff_py_hashes, MasterNode)
 
+# 这个用例会真的调一次 LLM（走 ACP），所以需要 API 凭据。
+# 凭据来自 secret_store，而 secret_store 的位置由 ZF_DATA_DIR 决定：
+#   - 外部已设 ZF_DATA_DIR（比如跑测试时导出了部署目录）→ 直接用
+#   - 否则退回到本机默认部署目录 D:\zerofall（存在才用）
+# 两处都拿不到 key 就 SKIP —— 这是环境缺件，不是代码坏了，
+# 不该让整套测试报红。
+import os as _os
+if not _os.environ.get('ZF_DATA_DIR'):
+    _deploy = Path(r'D:\zerofall')
+    if _deploy.is_dir() and (_deploy / 'secrets.json').exists():
+        _os.environ['ZF_DATA_DIR'] = str(_deploy)
+
+try:
+    from modules import secret_store as _ss
+    _has_key = any(_ss.get(_k) for _k in _ss.KNOWN_KEYS)
+except Exception:
+    _has_key = False
+if not _has_key:
+    print('SKIP: 没有可用的 API 凭据（secret_store 为空）')
+    print('      本用例需要真实调用一次 LLM。设置 ZF_DATA_DIR 指向含')
+    print('      secrets.json 的部署目录，或 export OPENCODE_GO_API_KEY 后重跑。')
+    sys.exit(0)
+
 WORK = Path(tempfile.mkdtemp(prefix='zf_fixonly_'))
 SRC = WORK / 'src'
 SRC.mkdir()
