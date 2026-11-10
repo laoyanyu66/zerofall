@@ -79,6 +79,15 @@
   各漏了一次，靠人工比对才发现。已在 `selfcheck.py` 加第 8 项检查，
   扫出 `modules/__init__.py`、`build_release.py`、`main.py`、
   `ui/main_window.py`、`modules/net_transport.py` 五处的版本号，不一致即提示
+- **改了排除规则后健康度持续红**
+  MD5 基线是某次 `update_baseline()` 按当时的排除规则生成的，之后往
+  `MD5_EXCLUDE_FILES` 里加新条目，旧基线不会自动更新——里面仍存着
+  那些易变文件的哈希。于是每次对比都判"不一致"，健康度永远红，
+  还会 `拒绝启动DeepSeek`。实测踩到过一次：10:46~11:07 连续 failed，
+  直到某次启动顺带重建基线才自己好。
+  现在 `run_full_check()` 会先扫一遍基线是否含"现已排除"的条目，
+  有就静默重建（代价约 100~200 ms，只在真检测到残留时才做）
+
 - **孤儿完整快照被误判为轻量**：`adopt_orphans` 用
   `n.startswith('primary-runtime')` 判断，但归档内真实路径是
   `config/primary-runtime/...`，判据永远为假。索引损坏后重新登记孤儿包时，

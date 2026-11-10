@@ -187,6 +187,35 @@ class EnvironmentChecker:
             return ''
         return _hl.md5('\n'.join(parts).encode('utf-8', 'replace')).hexdigest()
 
+    def _baseline_has_stale_entries(self) -> bool:
+        """基线里是否还留着"现在已排除"的易变文件
+
+        背景：MD5 基线是某次 update_baseline 时按当时的排除规则生成的。
+        后来往 MD5_EXCLUDE_FILES / MD5_EXCLUDE_DIRS 里加了新条目（比如
+        dsh-purge/last-cwd.txt、tiangong-state.json、profiles/*/cordis.yml），
+        旧基线并不会自动跟着变 —— 它里面仍然存着这些文件的哈希。
+        而这些文件本来就在持续变化，于是每次对比都判"MD5 不一致"，
+        健康度永远红、还会拒绝启动 DeepSeek。
+
+        实测：一次排除规则调整后，健康度连续红了 20 多分钟，
+        直到某次启动顺带重建基线才恢复。这里提前判出来，静默修掉。
+        """
+        import fnmatch as _fn
+        base = self._state.get('baseline_md5', {})
+        if not isinstance(base, dict):
+            return False
+        for _key, files in base.items():
+            if not isinstance(files, dict):
+                continue
+            for rel in files:
+                parts = str(rel).replace('\\', '/').split('/')
+                if any(p.lower() in MD5_EXCLUDE_DIRS for p in parts[:-1]):
+                    return True
+                fn = parts[-1].lower()
+                if any(_fn.fnmatch(fn, pat.lower()) for pat in MD5_EXCLUDE_FILES):
+                    return True
+        return False
+
     def update_baseline(self):
         """更新环境基线MD5"""
         baseline = {}
@@ -501,7 +530,17 @@ class EnvironmentChecker:
         # 只有自动流程才叫"前置启动校验"，手动校验不该刷这条日志
         if auto:
             ZeroFallLogger.pre_launch_check_started()
-        
+
+        # 基线自愈：排除规则调整过、但基线还是旧的，会导致 MD5 校验永远失败。
+        # 代价是一次全量 MD5（约 100~200 ms），只在真检测到残留时才做。
+        try:
+            if self._baseline_has_stale_entries():
+                ZeroFallLogger.info(
+                    "[环境校验] 基线包含已排除的易变文件（排除规则更新过），自动重建基线")
+                self.update_baseline()
+        except Exception as _e:
+            ZeroFallLogger.warning("[环境校验] 基线自愈失败: {}".format(_e))
+
         report = EnvironmentReport()
         report.last_exit_crash = self._state.get('last_exit_crash', False)
         
