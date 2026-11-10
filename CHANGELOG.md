@@ -79,6 +79,16 @@
   各漏了一次，靠人工比对才发现。已在 `selfcheck.py` 加第 8 项检查，
   扫出 `modules/__init__.py`、`build_release.py`、`main.py`、
   `ui/main_window.py`、`modules/net_transport.py` 五处的版本号，不一致即提示
+- **最小化到托盘时没有任何提示**
+  刚加「可选最小化到托盘」就发现：点 X 后窗口消失、日志写着
+  `[关闭] 托盘不支持气泡提示，跳过` —— 因为 `NativeTrayIcon` 从来没实现过
+  `show_message`。用户会以为程序被关掉了。
+  补上 `show_message(title, text, level)`，走 `NIF_INFO` + `Shell_NotifyIconW`。
+  实现时踩到一个坑：`shell32` 在该模块里是**每个方法内部各自取的局部变量**，
+  模块级根本没有这个名字，直接引用会抛 `AttributeError`，而异常被
+  `except` 吞掉后只表现为"返回 False"，查了半天。
+  现在失败会打 WARNING 并带上 GetLastError
+
 - **点 X 直接退出，没有"最小化到托盘"这个选项**
   QQ / 微信那套习惯：关窗口不等于退程序。ZeroFall 原来点 X 就直接走退出流程
   （`setQuitOnLastWindowClosed(False)` 只管住"窗口关了进程还在"，但

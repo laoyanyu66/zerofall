@@ -28,7 +28,14 @@ NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
 NIF_STATE = 0x00000008
+NIF_INFO = 0x00000010
 NIF_SHOWTIP = 0x00000080
+
+# 气泡图标类型
+NIIF_NONE = 0x00000000
+NIIF_INFO = 0x00000001
+NIIF_WARNING = 0x00000002
+NIIF_ERROR = 0x00000003
 
 NIS_FORCEINLINE = 0x00000040
 
@@ -576,6 +583,49 @@ class NativeTrayIcon(QObject):
     def setContextMenu(self, menu: QMenu):
         """设置右键菜单"""
         self._context_menu = menu
+
+    def show_message(self, title: str, text: str, timeout_ms: int = 5000,
+                     level: str = 'info') -> bool:
+        """弹一个托盘气泡通知
+
+        Windows 10/11 会把它转成系统通知中心的消息。ZeroFall 用它做
+        "已最小化到托盘"这类轻提示，免得用户以为程序被关掉了。
+
+        Args:
+            title: 标题（szInfoTitle 上限 64 字符，含结尾 NUL 所以截 63）
+            text:  正文（szInfo 上限 256 字符，截 255）
+            timeout_ms: 显示时长；Windows 10+ 由系统接管，此参数被忽略
+            level: 'info' / 'warning' / 'error'
+
+        Returns:
+            是否成功提交给系统
+        """
+        if not getattr(self, '_added', False) or not getattr(self, '_hwnd', 0):
+            return False
+        try:
+            flags = {'info': NIIF_INFO, 'warning': NIIF_WARNING,
+                     'error': NIIF_ERROR}.get(level, NIIF_INFO)
+            nid = NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+            nid.hWnd = self._hwnd
+            nid.uID = self._tray_id
+            nid.uFlags = NIF_INFO
+            nid.szInfo = str(text)[:255]
+            nid.szInfoTitle = str(title)[:63]
+            nid.dwInfoFlags = flags
+            # 注：这个字段在 NIF_INFO 场景下是 uTimeout（与 uVersion 联合体）
+            nid.uVersion = max(1, int(timeout_ms / 1000))
+            # 注意：shell32 是各方法内部各自取的局部变量，模块级没有这个名字
+            ok = bool(ctypes.windll.shell32.Shell_NotifyIconW(
+                NIM_MODIFY, ctypes.byref(nid)))
+            if not ok:
+                ZeroFallLogger.warning(
+                    "[托盘] 气泡提交失败 title={!r} GetLastError={}".format(
+                        str(title)[:30], ctypes.windll.kernel32.GetLastError()))
+            return ok
+        except Exception as e:
+            ZeroFallLogger.warning("[托盘] 气泡异常: {}".format(e))
+            return False
     
     def __del__(self):
         try:
