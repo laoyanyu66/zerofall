@@ -155,11 +155,19 @@ def build():
 
 
 def build_simple():
-    """小尺寸专用简化版
+    """小尺寸专用版
 
-    16/24px 上细节必然糊掉 —— 内弧、缺口端点、辉光在这个尺度都是噪点。
-    所以小图标不复用大图缩略，而是重画：更粗的单环 + 更大的核心 + 更大的
-    缺口，保证一眼能认出"环 + 点"这个骨架。
+    16/24px 上必然要简化，但**不能改变构图** —— 桌面上看到的是"双环 + 中心点"，
+    托盘里变成"单环 + 大圆点"的话，两者观感完全是两个图标。
+
+    所以这里保留完整版的双环结构，只做三件事：
+      1. 线条加粗（外环 0.092 / 内环 0.055，比完整版粗一倍）
+      2. 去掉中心辉光和缺口端点的渐变球（那个尺度上是噪点）
+      3. 加方块描边（深色底在深色任务栏上会和背景融成一片）
+
+    实测对比过三种：单环简化版、完整版直接缩、本方案。
+    完整版直接缩会因为渐变被平均而发暗发糊；单环版构图对不上；
+    这个版本在 16px 下仍能看出"双环 + 中心点"，和桌面图标是同一个东西。
     """
     size = W
     img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
@@ -167,26 +175,28 @@ def build_simple():
     img.paste(grad, (0, 0), rounded_mask(size))
 
     cx = cy = size // 2
-    d = ImageDraw.Draw(img)
 
-    # 单环，明显更粗
-    outer_r = int(size * 0.325)
-    ring_w = int(size * 0.105)
-    draw_arc_gradient(img, cx, cy, outer_r, ring_w,
-                      start_deg=30, end_deg=30 + 275,
+    # 外环：保留完整版的缺口位置（右上，22°），但明显加粗
+    draw_arc_gradient(img, cx, cy, int(size * 0.320), int(size * 0.092),
+                      start_deg=22, end_deg=22 + 305,
                       c_from=ACCENT, c_to=ACCENT2, steps=160)
 
-    # 核心：实心亮圆，比例放大
-    dot_r = int(size * 0.115)
+    # 内环：与完整版同样错开半圈，做出"轨道"层次
+    draw_arc_gradient(img, cx, cy, int(size * 0.178), int(size * 0.055),
+                      start_deg=200, end_deg=200 + 268,
+                      c_from=ACCENT2, c_to=ACCENT, steps=160)
+
+    # 中心点：半径取完整版和旧简化版之间
+    d = ImageDraw.Draw(img)
+    dot_r = int(size * 0.072)
     d.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
               fill=(228, 250, 255, 255))
     d.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
-              outline=ACCENT + (255,), width=int(size * 0.026))
+              outline=ACCENT + (255,), width=int(size * 0.020))
 
     # 外描边：把方块边界勾出来。
     # 深色底 #0c121e 在深色任务栏/托盘上会和背景融成一片，16px 时看着
     # 就像"只剩一个青色 C"，和桌面上那块醒目的深色圆角方块完全不像。
-    # 描边用亮青（不透明度给足），深色和浅色背景上都能看清轮廓。
     inset = max(2, int(size * 0.020))
     d.rounded_rectangle(
         [inset, inset, size - inset - 1, size - inset - 1],
