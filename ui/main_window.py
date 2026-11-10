@@ -533,7 +533,7 @@ class ZeroFallMainWindow(QMainWindow):
         brand.setObjectName('brand')
         row.addWidget(brand)
 
-        ver = QLabel("v1.5.0")
+        ver = QLabel("v1.5.1")
         ver.setObjectName('mute')
         row.addWidget(ver)
 
@@ -958,6 +958,25 @@ class ZeroFallMainWindow(QMainWindow):
             QTimer.singleShot(60000, self._consolidate_cloud_daily)
             # 启动 90 秒后处理一次本地溢出（把超限的旧快照归档到云）
             QTimer.singleShot(90000, self._handle_overflow_to_cloud)
+
+            # 上面三个原来都是 singleShot，只在启动时跑一次。后果是：启动之后
+            # 新产生的快照永远不会被判定为"溢出"，本地会一直堆。实测跑了一上午，
+            # 完整快照从 12 涨到 15、轻量堆到 68，全都没归档。
+            #
+            # 溢出归档必须是周期性的 —— 它负责把超限快照搬到云端再删本地，
+            # 是本地磁盘的唯一出口。
+            self._overflow_timer = QTimer(self)
+            self._overflow_timer.setInterval(
+                max(60, self._cfg_int('cloud_overflow_check_minutes', 10)) * 60 * 1000)
+            self._overflow_timer.timeout.connect(self._handle_overflow_to_cloud)
+            self._overflow_timer.start()
+
+            # 最新快照同步也做成周期，否则只有开机那一刻的会进同步盘
+            self._cloud_sync_timer = QTimer(self)
+            self._cloud_sync_timer.setInterval(
+                max(1, self._cfg_int('cloud_sync_interval_minutes', 60)) * 60 * 1000)
+            self._cloud_sync_timer.timeout.connect(self._sync_latest_to_cloud)
+            self._cloud_sync_timer.start()
         except Exception as e:
             ZeroFallLogger.error("[云同步] 初始化失败: {}".format(e))
     
@@ -1472,6 +1491,16 @@ class ZeroFallMainWindow(QMainWindow):
                 # 有变化：先记下来，等静置 settle 秒没有新变化再拍，
                 # 否则用户装插件时文件连续变化，会打出一串废快照
                 self._drift_fingerprint = fp
+
+                # 冷却保护：有些文件属于"程序在跑就会写"（会话配置、插件状态），
+                # 万一排除规则漏了某个，指纹会持续变化。没有冷却的话每 60 秒
+                # 就会排一个快照，实测 1.5 小时能堆 17 个、吃掉几 GB。
+                # 这里只更新基准、不记日志不排快照，把频率压到每 N 分钟最多一次。
+                cooldown = self._cfg_int('plugin_drift_cooldown_minutes', 5) * 60
+                last_snap = getattr(self, '_drift_last_snapshot_at', 0.0)
+                if cooldown > 0 and (now - last_snap) < cooldown:
+                    return
+
                 self._drift_changed_at = now
                 ZeroFallLogger.info(
                     "[变更检测] 插件/配置有改动，指纹 {} → {}，"
@@ -1500,6 +1529,8 @@ class ZeroFallMainWindow(QMainWindow):
         """因检测到改动而打快照（后台线程，避免卡 UI）"""
         import threading
         self._snapshot_busy = True
+        # 记下这次真正打出快照的时刻，供下次冷却判断
+        self._drift_last_snapshot_at = time.time()
 
         def _work():
             try:

@@ -45,6 +45,9 @@ MD5_EXCLUDE_DIRS = {
     'rea-engines', 'rea-jdk', 'tools', 'skills',
     # 会话数据天然持续变化（每次对话都会改），不适合做"篡改"比对
     'sessions',
+    # dsh-purge 插件的工作目录：last-cwd.txt 每切一次目录就重写，
+    # installed-rev 每次装载都更新，同样属于运行时状态
+    'dsh-purge',
 }
 
 # MD5 校验时跳过的文件（日志/运行时状态等易变文件，
@@ -54,6 +57,18 @@ MD5_EXCLUDE_FILES = [
     'applied.json', 'update-status.json',
     '*.db-journal', '*.db-wal',
     '.DS_Store', 'Thumbs.db',
+    # ── DSH / 插件运行时状态 ──
+    # 这些文件每次操作或切换会话都会重写，含义是"程序在跑"，
+    # 不是"用户改了插件"。实测不排除的话指纹每 1~2 分钟就变一次，
+    # 变更检测被打穿，快照暴涨（1.5 小时能堆 17 个）。
+    'last-cwd.txt',         # dsh-purge：当前工作目录
+    'installed-rev',        # dsh-purge：已安装版本标记
+    'preset-declare.json',  # 插件会话声明
+    'cordis.yml',           # DSH 会话配置（切会话就重写）
+    'cordis.yaml',
+    '*state.json',          # 插件状态，如 tiangong-state.json
+    '*state.jsonl',
+    '*.lock', '*.pid',
 ]
 
 class CheckResult(Enum):

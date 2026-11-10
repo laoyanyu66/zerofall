@@ -78,9 +78,90 @@ def generate_key(password: str, salt: bytes) -> bytes:
     )
     return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
-def encrypt_file(input_path: str, output_path: str, password: str) -> bool:
-    """加密文件"""
+
+# ── 分块加密格式 ──
+# Fernet 是整体加密（AES-CBC + HMAC），必须把整个文件读进内存，内部还要
+# 再做 CBC 输出、base64 编码（+33%），峰值内存约为文件大小的 5 倍。
+# 实测 194 MB 的快照在 4.8 GB 可用内存下直接 MemoryError，意味着
+# 大完整快照永远无法加密归档，只能留在本地 —— 磁盘会一直涨。
+#
+# 这里定义分块格式，超过阈值的文件按 8 MB 一块独立加密：
+#   MAGIC(8B) + CHUNK_SIZE(4B LE) + CHUNK_COUNT(4B LE) + 每块[ salt(16B) + len(4B LE) + 密文 ]
+# 每块独立 salt/Fernet，内存占用恒定为一块的量级。
+#
+# 兼容：旧文件没有 MAGIC，首 16 字节直接是 salt，按老路整体解密。
+_CHUNK_MAGIC = b'ZFCHUNK1'
+_CHUNK_SIZE = 8 * 1024 * 1024        # 单块 8 MB → 峰值内存约 40 MB
+_CHUNK_THRESHOLD = 64 * 1024 * 1024  # 超过 64 MB 自动分块
+
+
+def _encrypt_chunked(input_path: str, output_path: str, password: str) -> bool:
+    import struct
     try:
+        with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
+            fout.write(_CHUNK_MAGIC)
+            fout.write(struct.pack('<I', _CHUNK_SIZE))
+            count_pos = fout.tell()
+            fout.write(b'\x00\x00\x00\x00')      # 块数占位，最后回填
+            n = 0
+            while True:
+                chunk = fin.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                salt = os.urandom(16)
+                ct = Fernet(generate_key(password, salt)).encrypt(chunk)
+                fout.write(salt)
+                fout.write(struct.pack('<I', len(ct)))
+                fout.write(ct)
+                n += 1
+                del chunk, ct                    # 及时释放，别等循环下一轮
+            fout.seek(count_pos)
+            fout.write(struct.pack('<I', n))
+        return True
+    except Exception:
+        try:
+            if os.path.exists(output_path):
+                os.unlink(output_path)       # 半成品不能留，否则下次误判"已存在"
+        except Exception:
+            pass
+        return False
+
+
+def _decrypt_chunked(input_path: str, output_path: str, password: str) -> bool:
+    import struct
+    try:
+        with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
+            fin.read(8)                          # MAGIC
+            fin.read(4)                          # chunk size（当前未使用，保留）
+            count = struct.unpack('<I', fin.read(4))[0]
+            for _ in range(count):
+                salt = fin.read(16)
+                ln = struct.unpack('<I', fin.read(4))[0]
+                ct = fin.read(ln)
+                fout.write(Fernet(generate_key(password, salt)).decrypt(ct))
+        return True
+    except Exception:
+        try:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+        except Exception:
+            pass
+        return False
+
+
+def encrypt_file(input_path: str, output_path: str, password: str,
+                 chunked: bool = None) -> bool:
+    """加密文件
+
+    chunked=None 时按大小自动选择：超过 64 MB 走分块流式，
+    小文件保持原来的整体 Fernet（格式不变，老文件照常可解）。
+    """
+    try:
+        if chunked is None:
+            chunked = os.path.getsize(input_path) > _CHUNK_THRESHOLD
+        if chunked:
+            return _encrypt_chunked(input_path, output_path, password)
+
         salt = os.urandom(16)
         key = generate_key(password, salt)
         fernet = Fernet(key)
@@ -99,10 +180,17 @@ def encrypt_file(input_path: str, output_path: str, password: str) -> bool:
         return False
 
 def decrypt_file(input_path: str, output_path: str, password: str) -> bool:
-    """解密文件"""
+    """解密文件，自动识别分块格式与旧的整体 Fernet 格式"""
     try:
+        # 一次 open 读完，不要中途重新 open —— 重新 open 会把指针复位，
+        # 导致 f.read(8) 又读到开头那 8 字节，salt 就重复了。
         with open(input_path, 'rb') as f:
-            salt = f.read(16)
+            head = f.read(8)
+            if head == _CHUNK_MAGIC:
+                f.close()
+                return _decrypt_chunked(input_path, output_path, password)
+            # 旧格式：开头 16 字节就是 salt，整体一个 Fernet
+            salt = head + f.read(8)          # 补足 16 字节
             encrypted_data = f.read()
         
         key = generate_key(password, salt)

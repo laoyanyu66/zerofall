@@ -9,6 +9,52 @@
 
 ---
 
+## [1.5.1] - 2026-11-10
+
+上午跑了一轮实测，暴露三个会慢慢吃掉磁盘的问题，都不是崩给用户看的，
+而是"静默积累"型，靠看日志和核对数字才挖出来。
+
+### 修复（按严重程度）
+
+- **大快照永远无法加密归档 → 磁盘只进不出**
+  `encrypt_file` 用 Fernet 整体加密，把整个文件读进内存，内部还要再做
+  CBC 输出和 base64 编码（+33%），峰值约为文件大小的 5 倍。实测 194 MB
+  的完整快照在 4.8 GB 可用内存下直接 `MemoryError`，异常被
+  `except Exception: return False` 吞掉，只留一行"加密失败"。
+  后果：大快照归档失败 → 保留本地 → 重试 3 次后放弃 → 永久堆积。
+  改为**分块流式加密**（8 MB 一块，每块独立 salt + Fernet），超过 64 MB
+  自动走新格式，小文件保持原格式。实测 200 MB 文件加密 1.5 s、解密 1.1 s，
+  内存占用恒定在 40 MB 量级。新格式用 `ZFCHUNK1` 魔数区分，
+  已有的旧 `.enc` 文件照常可解（已验证 24 MB 与 182 MB 两种）
+
+- **本地溢出归档只在启动时跑一次**
+  `_sync_latest_to_cloud` / `_consolidate_cloud_daily` / `_handle_overflow_to_cloud`
+  三个调度全是 `QTimer.singleShot`，开机后各跑一次就再也不跑。
+  而 `_handle_overflow_to_cloud` 是本地磁盘的**唯一出口**（超限快照传云端
+  再删本地）。实测跑一上午：轻量堆到 68、完整堆到 15，全都没归档，
+  本地占用从 2.4 GB 涨到 4.3 GB。改为周期定时器
+  （`cloud_overflow_check_minutes` 默认 10 分钟）
+
+- **插件指纹把运行时状态当成"环境改动" → 快照暴涨**
+  `quick_fingerprint()` 取 `(路径, mtime, size)` 做哈希，但没有排除
+  DSH 自身的运行时状态文件：`dsh-purge/last-cwd.txt`（每次切目录就写）、
+  `tiangong-state.json`、`redteam/preset-declare.json`、
+  `profiles/*/cordis.yml`。结果指纹每 1~2 分钟就变一次，变更检测被打穿。
+  实测 2 小时触发 **88 次**告警、打出 **49 个**快照。
+  补进 `MD5_EXCLUDE_FILES` / `MD5_EXCLUDE_DIRS` 后，同样时长 **0 次**。
+  另外加 `plugin_drift_cooldown_minutes`（默认 5）兜底：万一以后还有
+  没预料的易活文件，最多 5 分钟一次，不至于失控
+
+### 说明
+
+- 那两个用**旧固定密码**加密的历史 `.enc`（182 MB / 82 MB）仍能用
+  `decrypt_snapshot` 的 legacy 回退解开，数据没丢；只是 `decrypt_file`
+  直接调用时不会回退，所以直接调它会报 `InvalidToken`
+- crashed 快照不参与溢出判定（`get_full_snapshots` 只算 healthy），
+  这是有意为之——崩溃现场保留下来供事后分析，不计入常规上限
+
+---
+
 ## [1.5.0] - 2026-11-10
 
 ### 变更

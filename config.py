@@ -31,6 +31,15 @@ class ZeroFallConfig:
     plugin_drift_snapshot: bool = True        # 检测到插件/配置变更时自动快照
     plugin_drift_check_seconds: int = 60      # 多久检查一次（秒）
     plugin_drift_settle_seconds: int = 20     # 最后一次变化后静置多久才拍（防抖）
+    # 两次变更点快照之间的最短间隔（分钟）。有些文件是"程序在跑就会写"的
+    # 运行时状态，指纹会持续变化；靠排除规则挡掉大部分，这条是兜底，
+    # 避免排除规则漏了某个文件时快照暴涨。设 0 表示不设冷却。
+    plugin_drift_cooldown_minutes: int = 5
+    # 本地溢出归档检查周期（分钟）：超限快照先传云端再删本地，是磁盘唯一出口。
+    # 原来是启动时 singleShot 一次，跑一上午就堆到 68 轻量 + 15 完整。
+    # 注意 cloud_sync_interval_minutes 定义在下面（每小时的同步周期），不要重复定义，
+    # dataclass 会静默用后一个覆盖前一个。
+    cloud_overflow_check_minutes: int = 10
     auto_silent_snapshot: bool = True         # 后台定时静默快照
     silent_snapshot_interval_minutes: int = 10  # 静默快照间隔（分钟）
     

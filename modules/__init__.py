@@ -2,7 +2,7 @@
 ZeroFall 模块包
 """
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 from .snapshot_manager import SnapshotManager, SnapshotData
 from .environment_checker import EnvironmentChecker
 from .guardian import Guardian
