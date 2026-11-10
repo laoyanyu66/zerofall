@@ -1297,6 +1297,13 @@ class ZeroFallMainWindow(QMainWindow):
                 rec = self.snapshot_manager.reconcile_with_disk()
                 pruned = rec.get('pruned') or []
                 adopted = rec.get('adopted') or []
+                # 修正历史上被旧判据误标成崩溃的快照（notes 里没写"崩溃"的那些）。
+                # 旧判据只看"创建时 DeepSeek 在不在跑"，手动快照和环境校验失败
+                # 期间的定时快照都会被误标，占满 max_crashed_snapshots 名额。
+                try:
+                    self.snapshot_manager.repair_misjudged_crashed()
+                except Exception as _e:
+                    ZeroFallLogger.warning("[启动清理] 修正误判崩溃快照失败: {}".format(_e))
                 # 日志保留：log_backup_count 以前是个没人读的配置项
                 logs = 0
                 try:

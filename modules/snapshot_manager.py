@@ -529,13 +529,24 @@ class SnapshotManager:
             ZeroFallLogger.info(f"开始创建快照: {snapshot_id}")
             
             # 确定快照状态
+            #
+            # 判据不要用"创建时 DeepSeek 在不在跑" —— 那会把大量正常快照
+            # 误判成崩溃：用户手动「快速快照」时没开 DeepSeek、环境校验失败
+            # 导致它拒绝启动、或者用户就是想关掉它再打快照，都会命中。
+            # 实测误判出来的 crashed 既不参与恢复链，还会占满
+            # max_crashed_snapshots 的名额。
+            #
+            # 真正需要"标记这个点有问题"的只有崩溃现场，而那些都是
+            # guardian / 崩溃处理逻辑显式创建、并在 notes 里写明"崩溃"的：
+            #   guardian.py      notes=f"崩溃自动快照 (退出码: {exit_code})"
+            #   main_window.py   notes="崩溃快照 (退出码 {})"
+            # 所以这里以 notes 为准，其余一律 HEALTHY（内容本身是完整的）。
             if force_healthy:
                 status = SnapshotStatus.HEALTHY
+            elif '崩溃' in (notes or ''):
+                status = SnapshotStatus.CRASHED
             else:
-                # 检查DeepSeek是否正常运行
-                from utils import get_process_info
-                deepseek_proc = get_process_info("DeepSeek")
-                status = SnapshotStatus.HEALTHY if deepseek_proc else SnapshotStatus.CRASHED
+                status = SnapshotStatus.HEALTHY
             
             # 备份插件目录（排除 node_modules 等大目录，否则单次快照可达上百 MB）
             if self.config.backup_plugins:
@@ -1177,6 +1188,34 @@ class SnapshotManager:
         except Exception:
             return ""
     
+    def repair_misjudged_crashed(self, save: bool = True) -> List[str]:
+        """修正历史误判：notes 里没有"崩溃"字样、却被标成 CRASHED 的快照
+
+        旧判据是 `HEALTHY if deepseek_proc else CRASHED`，只要创建那一刻
+        DeepSeek 没在跑就记成崩溃。结果：
+          · 用户手动「快速快照」时没开 DeepSeek → 记成崩溃
+          · 环境校验失败、DeepSeek 拒绝启动期间的定时静默快照 → 记成崩溃
+        这些快照内容完全正常，只是标签错了。留着会占满
+        max_crashed_snapshots 的名额，也让界面统计失真。
+
+        只改标签，不动文件内容；真崩溃现场（notes 含"崩溃"）原样保留。
+        """
+        fixed = []
+        for sid, snap in self.snapshots.items():
+            if snap.status != SnapshotStatus.CRASHED:
+                continue
+            if '崩溃' in (getattr(snap, 'notes', '') or ''):
+                continue
+            snap.status = SnapshotStatus.HEALTHY
+            fixed.append(sid)
+        if fixed:
+            if save:
+                self._save_index()
+            ZeroFallLogger.info(
+                "修正 {} 个误判为崩溃的快照（notes 未标记崩溃）: {}".format(
+                    len(fixed), ', '.join(sorted(fixed)[:5])))
+        return fixed
+
     def get_crashed_snapshots(self) -> List[SnapshotData]:
         """获取崩溃快照列表"""
         return [

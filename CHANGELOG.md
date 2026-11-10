@@ -79,6 +79,21 @@
   各漏了一次，靠人工比对才发现。已在 `selfcheck.py` 加第 8 项检查，
   扫出 `modules/__init__.py`、`build_release.py`、`main.py`、
   `ui/main_window.py`、`modules/net_transport.py` 五处的版本号，不一致即提示
+- **崩溃判定把你正常快照也标成崩溃**
+  `create_snapshot` 原来只看"创建那一刻 DeepSeek 在不在跑"：
+  `status = HEALTHY if deepseek_proc else CRASHED`。但"没在跑"有三种情况，
+  只有一种是真崩溃，另外两种是正常快照：
+    · 用户手动「快速快照」时没开 DeepSeek
+    · 环境校验失败、DeepSeek 拒绝启动期间的定时静默快照
+    · 用户就是想关掉它再打快照
+  这些快照内容完全正常，却被标成 crashed —— 而 crashed 不参与恢复链
+  （`find_overlay_chain` 只取 HEALTHY），等于白白损失一个可用恢复点，
+  还会占满 `max_crashed_snapshots` 名额。
+  改成以 `notes` 为准：只有 guardian / 崩溃处理逻辑显式创建、
+  并在 notes 里写明"崩溃"的才算崩溃现场，其余一律 HEALTHY。
+  同时加 `repair_misjudged_crashed()`，启动时把历史上误标的改回来
+  （只改标签不动文件）。实测修正 1 个，修正后它成功进入恢复链
+
 - **崩溃快照永久占本地磁盘**
   `get_light_snapshots()` / `get_full_snapshots()` 都硬编码 `status == HEALTHY`，
   而 `get_overflow_snapshots()` 只从这两个列表取溢出——crashed 快照既不算
