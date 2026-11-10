@@ -538,7 +538,23 @@ class SettingsTab(QWidget):
         _cd_hint = QLabel("0 = 不限时，必须手动确认")
         _cd_hint.setStyleSheet("color: gray; font-size: 11px;")
         behavior_layout.addWidget(_cd_hint, 2, 2)
-        
+
+        # 点右上角 X 的行为：QQ/微信那套习惯，可选托盘驻留或直接退出
+        behavior_layout.addWidget(QLabel("点关闭按钮时:"), 3, 0)
+        self.close_action_combo = QComboBox()
+        self.close_action_combo.addItem("每次询问（可勾选记住）", "ask")
+        self.close_action_combo.addItem("最小化到托盘，继续守护", "minimize")
+        self.close_action_combo.addItem("直接退出程序", "exit")
+        _ca = (getattr(self.config, "close_action", "ask") or "ask").strip().lower()
+        _idx = self.close_action_combo.findData(_ca)
+        self.close_action_combo.setCurrentIndex(_idx if _idx >= 0 else 0)
+        self.close_action_combo.setToolTip(
+            "最小化到托盘：窗口隐藏，仍在后台盯 DeepSeek 和快照，\n"
+            "双击托盘图标恢复窗口。\n"
+            "直接退出：ZeroFall 完全结束，守护和定时快照都会停止。\n"
+            "选「每次询问」时，弹窗里勾「记住我的选择」也会写回这里。")
+        behavior_layout.addWidget(self.close_action_combo, 3, 1, 1, 2)
+
         behavior_group.setLayout(behavior_layout)
         layout.addWidget(behavior_group)
         
@@ -674,6 +690,13 @@ class SettingsTab(QWidget):
         self.config.auto_launch_deepseek = self.auto_launch_check.isChecked()
         self.config.auto_exit_after_deepseek_close = self.auto_exit_check.isChecked()
         self.config.auto_rollback_on_crash = self.auto_rollback_check.isChecked()
+        # 关闭按钮行为（ask / minimize / exit）
+        try:
+            _ca = self.close_action_combo.currentData()
+            if _ca in ('ask', 'minimize', 'exit'):
+                self.config.close_action = _ca
+        except Exception:
+            pass
         try:
             self.config.crash_restore_countdown = int(self.crash_countdown_spin.value())
         except Exception:

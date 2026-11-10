@@ -182,6 +182,17 @@ def build_simple():
               fill=(228, 250, 255, 255))
     d.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
               outline=ACCENT + (255,), width=int(size * 0.026))
+
+    # 外描边：把方块边界勾出来。
+    # 深色底 #0c121e 在深色任务栏/托盘上会和背景融成一片，16px 时看着
+    # 就像"只剩一个青色 C"，和桌面上那块醒目的深色圆角方块完全不像。
+    # 描边用亮青（不透明度给足），深色和浅色背景上都能看清轮廓。
+    inset = max(2, int(size * 0.020))
+    d.rounded_rectangle(
+        [inset, inset, size - inset - 1, size - inset - 1],
+        radius=int(size * 0.225) - inset,
+        outline=ACCENT + (170,),
+        width=max(2, int(size * 0.016)))
     return img
 
 

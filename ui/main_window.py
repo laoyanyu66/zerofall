@@ -3042,7 +3042,103 @@ class ZeroFallMainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
     
     def closeEvent(self, event):
-        """关闭窗口事件 - 优雅退出 + 共生退出"""
+        """点右上角 X —— 按配置决定"最小化到托盘"还是"直接退出"
+
+        三种行为（config.close_action）：
+          ask       每次弹窗让用户选，可勾"记住我的选择"
+          minimize  直接缩到托盘，继续后台守护（QQ / 微信的习惯）
+          exit      直接退出程序
+
+        注意 main.py 里设了 setQuitOnLastWindowClosed(False)，
+        那是为了让"隐藏窗口后进程能活着"；真正退不退出由这里决定。
+        """
+        action = (getattr(self.config, 'close_action', 'ask') or 'ask').strip().lower()
+
+        if action == 'minimize':
+            self._minimize_to_tray()
+            event.ignore()
+            return
+        if action == 'exit':
+            self._finish_exit(event)
+            return
+
+        choice = self._ask_close_action()
+        if choice == 'cancel':
+            event.ignore()
+            return
+        if choice == 'minimize':
+            self._minimize_to_tray()
+            event.ignore()
+            return
+        self._finish_exit(event)
+
+    def _minimize_to_tray(self):
+        """隐藏窗口但保留进程，托盘图标继续可用"""
+        try:
+            self.hide()
+        except Exception:
+            pass
+        ZeroFallLogger.info("[关闭] 已最小化到托盘，继续守护 DeepSeek")
+        # 第一次这么做时给个气泡，免得用户以为程序没了
+        if not getattr(self, '_tray_hint_shown', False):
+            self._tray_hint_shown = True
+            try:
+                _nt = getattr(self, 'native_tray', None) or getattr(self, 'tray', None)
+                if _nt is not None and hasattr(_nt, 'show_message'):
+                    _nt.show_message("ZeroFall 仍在运行",
+                                     "已最小化到托盘，双击图标可恢复窗口。")
+                else:
+                    ZeroFallLogger.info("[关闭] 托盘不支持气泡提示，跳过")
+            except Exception as _e:
+                ZeroFallLogger.warning("[关闭] 托盘提示失败: {}".format(_e))
+
+    def _ask_close_action(self):
+        """弹窗问用户：最小化到托盘 / 直接退出，可勾选记住
+
+        Returns:
+            'minimize' / 'exit' / 'cancel'
+        """
+        from PyQt6.QtWidgets import QMessageBox, QCheckBox
+        box = QMessageBox(self)
+        box.setWindowTitle("关闭 ZeroFall")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("要最小化到托盘继续守护，还是直接退出？")
+        box.setInformativeText(
+            "最小化到托盘：窗口隐藏，仍在后台盯着 DeepSeek 和快照，\n"
+            "双击托盘图标可恢复窗口。\n\n"
+            "直接退出：ZeroFall 完全结束，守护和定时快照都会停止。")
+        btn_tray = box.addButton("最小化到托盘", QMessageBox.ButtonRole.AcceptRole)
+        btn_exit = box.addButton("直接退出", QMessageBox.ButtonRole.DestructiveRole)
+        btn_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_tray)
+        chk = QCheckBox("记住我的选择")
+        box.setCheckBox(chk)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is btn_cancel:
+            return 'cancel'
+
+        remember = chk.isChecked()
+        if clicked is btn_tray:
+            if remember:
+                self.config.close_action = 'minimize'
+                try:
+                    self.config_manager.save()
+                except Exception:
+                    pass
+            return 'minimize'
+
+        if remember:
+            self.config.close_action = 'exit'
+            try:
+                self.config_manager.save()
+            except Exception:
+                pass
+        return 'exit'
+
+    def _finish_exit(self, event):
+        """真正的退出流程（原 closeEvent 的全部逻辑）"""
         # 1. 如果 DeepSeek 在运行，询问是否同时终止（共生退出）
         if self.guardian.is_deepseek_running():
             reply = QMessageBox.question(

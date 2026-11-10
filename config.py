@@ -173,6 +173,12 @@ class ZeroFallConfig:
     
     # 程序行为配置
     auto_exit_after_deepseek_close: bool = True  # DeepSeek关闭后ZeroFall自动退出
+    # 点右上角 X 时的行为：
+    #   ask      —— 每次弹窗让用户选（默认，首次使用最友好）
+    #   minimize —— 直接最小化到托盘，继续守护（QQ/微信那种习惯）
+    #   exit     —— 直接退出程序
+    # 选过一次之后可以勾"记住"，写在这里
+    close_action: str = "ask"
     auto_launch_deepseek: bool = True            # 自检全部通过后自动启动DeepSeek
     auto_rollback_on_crash: bool = True          # DeepSeek崩溃后自动回退最新健康快照并重启
     max_auto_rollback: int = 2                   # 连续自动回退多少次后转为人工确认（不再是硬上限）
