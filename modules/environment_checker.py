@@ -431,6 +431,66 @@ class EnvironmentChecker:
             "退出码: {}".format(code_text)
         )
 
+    def check_system_resources(self) -> CheckItem:
+        """系统资源充裕度：页面文件过小会让进程被系统直接终止
+
+        实测踩到：本机物理内存 15.7 GB，但页面文件只有 106 MB，且关掉了
+        自动管理。Windows 诊断出「虚拟内存不足」（事件 2004）后直接终止了
+        ZeroFall —— 日志里连"优雅退出"都没有，只剩最后一行托盘图标。
+        一上午发生两次，很容易被误认为程序崩溃。
+
+        ZeroFall 常驻 170~220 MB 且长期运行，在这种配置下最容易被挑中。
+
+        只报 WARNING 不报 FAILED：这是系统配置问题，不该阻止启动，
+        但要让用户知道"进程突然消失"不一定是程序的锅。
+        """
+        try:
+            import ctypes
+
+            class _MEM(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+
+            m = _MEM()
+            m.dwLength = ctypes.sizeof(_MEM)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return CheckItem("系统资源", CheckResult.PASSED, "无法读取内存信息，跳过")
+
+            total_gb = m.ullTotalPhys / (1024 ** 3)
+            # ullTotalPageFile 含物理内存，减掉才是页面文件本身
+            pf_gb = max(0.0, (m.ullTotalPageFile - m.ullTotalPhys) / (1024 ** 3))
+            load = m.dwMemoryLoad
+            avail_pf_gb = m.ullAvailPageFile / (1024 ** 3)
+            ratio = (pf_gb / total_gb) if total_gb > 0 else 0.0
+            detail = ("物理 {:.1f} GB（已用 {}%），页面文件 {:.2f} GB（占物理 {:.0%}），"
+                      "可提交余量 {:.2f} GB").format(total_gb, load, pf_gb, ratio, avail_pf_gb)
+
+            # 两个判据都说明"没有缓冲垫"：页面文件绝对大小偏小，或占物理内存比例过低。
+            # 实测本机 15.7 GB 内存配 1.88 GB 页面文件（12%），Windows 报过
+            # 事件 2004「虚拟内存不足」并终止了 ZeroFall。
+            if pf_gb < 2.0 or ratio < 0.15:
+                return CheckItem(
+                    "系统资源", CheckResult.WARNING,
+                    "页面文件 {:.2f} GB 偏小（占物理 {:.0%}）".format(pf_gb, ratio),
+                    detail + "。内存吃紧时系统会直接终止进程，表现为 ZeroFall "
+                             "突然消失、日志里没有退出记录。建议在「系统属性 → 高级 → "
+                             "性能设置 → 高级 → 虚拟内存」改为自动管理，"
+                             "或手动设为物理内存的 25% 以上。")
+            if load >= 85 or avail_pf_gb < 1.0:
+                return CheckItem("系统资源", CheckResult.WARNING,
+                                 "内存吃紧（已用 {}%，可提交余量 {:.2f} GB）".format(
+                                     load, avail_pf_gb), detail)
+            return CheckItem("系统资源", CheckResult.PASSED,
+                             "充足（内存已用 {}%，页面文件 {:.2f} GB）".format(load, pf_gb),
+                             detail)
+        except Exception as e:
+            return CheckItem("系统资源", CheckResult.PASSED, "检查跳过: {}".format(e))
+
     def check_session_integrity(self) -> CheckItem:
         """会话文件完整性校验"""
         if not self.config.session_integrity_check:
@@ -552,6 +612,7 @@ class EnvironmentChecker:
             self.check_unbackup_changes(),
             self.check_last_exit(),
             self.check_session_integrity(),
+            self.check_system_resources(),
         ]
         
         for item in checks:

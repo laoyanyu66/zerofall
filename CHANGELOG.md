@@ -79,6 +79,17 @@
   各漏了一次，靠人工比对才发现。已在 `selfcheck.py` 加第 8 项检查，
   扫出 `modules/__init__.py`、`build_release.py`、`main.py`、
   `ui/main_window.py`、`modules/net_transport.py` 五处的版本号，不一致即提示
+- **进程突然消失但查不到原因**
+  实测一上午发生两次：ZeroFall 无声无息没了，日志停在最后一行托盘图标，
+  既没有"优雅退出"记录、也没有崩溃日志，`last_exit_code` 还是 0。
+  翻 Windows 事件日志才找到真相——事件 2004：
+  「Windows 成功诊断出虚拟内存不足的情况……ZeroFall.exe 使用了大部分虚拟内存」。
+  本机物理内存 15.7 GB，页面文件只有 1.88 GB（占物理 12%），
+  ZeroFall 常驻约 200 MB 且长期运行，在内存吃紧时最容易被系统挑中终止。
+  新增环境检查项「系统资源」：页面文件 < 2 GB 或占物理 < 15% 时报 WARNING，
+  并说明"进程突然消失不一定是程序的问题"。只警告不阻止启动——
+  这是系统配置问题，不该挡住用户干活
+
 - **崩溃判定把你正常快照也标成崩溃**
   `create_snapshot` 原来只看"创建那一刻 DeepSeek 在不在跑"：
   `status = HEALTHY if deepseek_proc else CRASHED`。但"没在跑"有三种情况，
