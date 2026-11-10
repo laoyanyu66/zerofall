@@ -424,10 +424,22 @@ class EnvironmentChecker:
                 "退出码: {}（该标记已重置）".format(code_text)
             )
 
+        # 崩溃且当前没在运行 —— 报 WARNING，**不报 FAILED**。
+        #
+        # 原来这里报 FAILED，会走进"环境校验失败 → 拒绝启动 DeepSeek"的分支，
+        # 于是 DeepSeek 崩了以后再也起不来，因为唯一的修复动作（启动它）
+        # 恰恰被这条校验拦住了。实测日志：
+        #   15:36:44 CRITICAL DeepSeek异常退出 | 退出码: 4294967295
+        #   15:36:47 前置启动校验完成 | 状态: failed
+        #   15:36:48 ERROR   环境校验失败，拒绝启动DeepSeek
+        #   15:36:52 DeepSeek客户端启动成功      ← 靠用户手动才绕过去
+        #
+        # 现在降成 WARNING：提示"上次崩了、现在没运行"，但放行启动。
+        # 启动成功后下一次校验会走 running 分支把标记清掉，自动恢复绿灯。
         return CheckItem(
             "上次退出状态",
-            CheckResult.FAILED,
-            "上次DeepSeek异常退出/崩溃，且当前未运行",
+            CheckResult.WARNING,
+            "上次DeepSeek异常退出/崩溃，当前未运行（允许启动以恢复）",
             "退出码: {}".format(code_text)
         )
 
@@ -470,20 +482,30 @@ class EnvironmentChecker:
             detail = ("物理 {:.1f} GB（已用 {}%），页面文件 {:.2f} GB（占物理 {:.0%}），"
                       "可提交余量 {:.2f} GB").format(total_gb, load, pf_gb, ratio, avail_pf_gb)
 
-            # 两个判据都说明"没有缓冲垫"：页面文件绝对大小偏小，或占物理内存比例过低。
-            # 实测本机 15.7 GB 内存配 1.88 GB 页面文件（12%），Windows 报过
-            # 事件 2004「虚拟内存不足」并终止了 ZeroFall。
+            # 页面文件偏小时**不报 warning**。
+            #
+            # 实测本机 15.7 GB 内存只配了 1.88 GB 页面文件（12%），Windows 报过
+            # 事件 2004「虚拟内存不足」并终止了 ZeroFall。这条信息真有价值，
+            # 但它不是 ZeroFall 的故障，而是系统配置问题 —— 而改它需要管理员权限，
+            # 本机 UAC 又处在 ConsentPromptBehaviorAdmin=0 + PromptOnSecureDesktop=1
+            # 的矛盾状态（既弹窗也不提权，静默拒绝），用户根本改不了。
+            #
+            # 结果就是：一条永远消不掉的黄色警告挂在界面上，冲淡了真正需要处理的
+            # 失败项。所以降级成 PASSED，把完整数值和建议留在 detail 里，
+            # 用户想知道时点开能看见，但不再干扰总体结论。
             if pf_gb < 2.0 or ratio < 0.15:
                 return CheckItem(
-                    "系统资源", CheckResult.WARNING,
-                    "页面文件 {:.2f} GB 偏小（占物理 {:.0%}）".format(pf_gb, ratio),
-                    detail + "。内存吃紧时系统会直接终止进程，表现为 ZeroFall "
-                             "突然消失、日志里没有退出记录。建议在「系统属性 → 高级 → "
-                             "性能设置 → 高级 → 虚拟内存」改为自动管理，"
-                             "或手动设为物理内存的 25% 以上。")
+                    "系统资源", CheckResult.PASSED,
+                    "页面文件 {:.2f} GB（占物理 {:.0%}，偏小）".format(pf_gb, ratio),
+                    detail + "。提示：页面文件偏小时，内存吃紧的系统会直接终止进程，"
+                             "表现为 ZeroFall 突然消失、日志里没有退出记录。"
+                             "如需根治，在「系统属性 → 高级 → 性能设置 → 高级 → 虚拟内存」"
+                             "改为自动管理，或手动设为物理内存的 25% 以上。"
+                             "此项不计入警告，因为它属于系统配置问题，不影响 ZeroFall 判断。")
+            # 内存吃紧同理：只说明状态，不算 ZeroFall 的问题
             if load >= 85 or avail_pf_gb < 1.0:
-                return CheckItem("系统资源", CheckResult.WARNING,
-                                 "内存吃紧（已用 {}%，可提交余量 {:.2f} GB）".format(
+                return CheckItem("系统资源", CheckResult.PASSED,
+                                 "内存已用 {}%（可提交余量 {:.2f} GB）".format(
                                      load, avail_pf_gb), detail)
             return CheckItem("系统资源", CheckResult.PASSED,
                              "充足（内存已用 {}%，页面文件 {:.2f} GB）".format(load, pf_gb),

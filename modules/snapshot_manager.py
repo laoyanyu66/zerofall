@@ -606,10 +606,27 @@ class SnapshotManager:
                                 else:
                                     raise
                     # Local Storage / Session Storage（leveldb）
+                    #
+                    # leveldb 会持续轮转：写满的 .log 落成 .ldb、旧的 .ldb 被删、
+                    # MANIFEST/CURRENT 被改写。复制过程中这些文件随时可能消失，
+                    # 于是 copytree 抛 FileNotFoundError（WinError 2）：
+                    #   ERROR 创建快照失败: [WinError 2] 系统找不到指定的文件。:
+                    #   '...\\auth\\Local Storage\\leveldb\\000014.ldb'
+                    # 这不是缺陷，是 Chromium 存储引擎的正常行为。
+                    # 逐个目录单独兜住，让残余文件照样备份，不牵连整次快照。
                     for dname in ("Local Storage", "Session Storage"):
                         d = auth_src / dname
                         if d.is_dir():
-                            copy_directory(str(d), str(auth_dst / dname))
+                            try:
+                                copy_directory(str(d), str(auth_dst / dname))
+                            except FileNotFoundError as fnf_err:
+                                ZeroFallLogger.debug(
+                                    "{} 有文件在复制时被 leveldb 轮转删除，"
+                                    "已复制其余部分: {}".format(dname, fnf_err))
+                            except OSError as os_err:
+                                ZeroFallLogger.debug(
+                                    "{} 复制不完整（登录态主体已尽力保留）: {}".format(
+                                        dname, os_err))
                     ZeroFallLogger.debug(
                         "认证态备份完成 -> {}{}".format(
                             auth_dst,

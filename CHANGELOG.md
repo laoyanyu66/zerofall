@@ -53,6 +53,38 @@
 - crashed 快照不参与溢出判定（`get_full_snapshots` 只算 healthy），
   这是有意为之——崩溃现场保留下来供事后分析，不计入常规上限
 
+### 修复（下午自检第二轮）
+
+- **健康度被一条改不掉的警告长期染黄**
+  `check_system_resources` 把「页面文件偏小」判成 WARNING。本机 15.7 GB
+  内存只配了 1.88 GB 页面文件（12%），Windows 确实报过事件 2004 并终止过
+  ZeroFall，但这是**系统配置问题**，不是 ZeroFall 的故障；而改它需要管理员
+  权限，本机 UAC 又处在 `ConsentPromptBehaviorAdmin=0` +
+  `PromptOnSecureDesktop=1` 的矛盾状态（既不弹窗也不提权，静默拒绝），
+  用户无法自行修复。结果是一条永远消不掉的黄灯挂在界面上，把真正需要
+  处理的失败项冲淡了。改为 PASSED，完整数值和建议保留在 detail 里，
+  点开仍能看到「页面文件 1.88 GB（占物理 12%，偏小）」。
+
+- **DeepSeek 崩溃后陷入「拒绝启动 → 起不来 → 继续拒绝」的死循环**
+  `check_last_exit` 在「上次崩溃且当前未运行」时报 FAILED，而 FAILED 会走进
+  「环境校验失败 → 拒绝启动 DeepSeek」的分支——**唯一的修复动作（启动它）
+  恰恰被这条校验拦住**。实测日志：
+  `15:36:44 CRITICAL DeepSeek异常退出 | 退出码: 4294967295` →
+  `15:36:48 ERROR 环境校验失败，拒绝启动DeepSeek` →
+  `15:36:52 DeepSeek客户端启动成功`（靠用户手动才绕过去）。
+  降为 WARNING：提示「上次崩了、现在没运行」，但放行启动。启动成功后
+  下一次校验会走 running 分支自动清标记，无需人工干预。
+
+- **Chromium leveldb 轮转让整次快照失败**
+  `Local Storage/leveldb` 里的 `.ldb`/`.log` 会被 Chromium 持续轮转
+  （旧的删除、新的落盘），复制过程中原文件随时消失，`copytree` 抛
+  `FileNotFoundError: [WinError 2] ... 000014.ldb`，被最外层的
+  `except Exception` 记成 ERROR「创建快照失败」，整次快照作废：
+  `15:13:32 ERROR 创建快照失败: [WinError 2] ... '000014.ldb'` →
+  `15:13:32 WARNING 静默快照创建失败`。
+  这不是缺陷而是 leveldb 的正常行为。改为对每个存储目录单独兜住
+  `FileNotFoundError` / `OSError`，已复制的部分照样保留，不再牵连主快照。
+
 ---
 
 ## [1.5.0] - 2026-11-10
