@@ -921,7 +921,7 @@ class HttpControlChannel:
 
     # ── 底层请求 ────────────────────────────────────────────
     def _headers(self):
-        h = {'User-Agent': 'ZeroFall-Agent/1.3.0'}
+        h = {'User-Agent': 'ZeroFall-Agent/1.5.0'}
         if self.token:
             h['X-ZF-Token'] = self.token
         return h

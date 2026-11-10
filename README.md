@@ -139,6 +139,7 @@ ZeroFall/
 ├── logger.py            日志
 ├── utils.py             加密、时间、进程工具
 ├── build_release.py     出包（standalone / master / agent）
+├── build_package.py     便携包 / 免安装包打包
 ├── make_icon.py         生成图标（多尺寸分级绘制）
 ├── modules/             核心能力
 │   ├── snapshot_manager.py     快照创建/恢复/索引
@@ -152,13 +153,38 @@ ZeroFall/
 │   └── ...
 ├── ui/                  界面（theme.py 是设计令牌，dialogs.py 是统一弹窗）
 ├── tools/               开发期辅助脚本，不参与运行时
+├── tests/               测试（37 个，python tests/test_xxx.py 直接跑）
 ├── docs/
 │   ├── PACKAGING.md     打包说明
 │   └── archive/         历史版本文档
-├── test_*.py            测试（直接 python test_xxx.py 运行）
+├── selfcheck.py         静态自检（扫 `or <数字>` 吞零、调用先于定义等陷阱）
+├── rebuild_index.py     快照索引重建（索引损坏时用）
 ├── README.md / CHANGELOG.md / LICENSE
 └── ZeroFall.ico
 ```
+
+## 跑测试
+
+```powershell
+# 单个用例
+python tests/test_lifecycle_health.py
+
+# 主控/子控总验收（快，不含真实 ACP 调用和 pyinstaller）
+python tests/test_all_control.py
+
+# 全部 37 个（约 4 分钟，其中 e2e 会真的调 pyinstaller 打包）
+Get-ChildItem tests -Filter "test_*.py" | ForEach-Object { python $_.FullName }
+
+# 静态自检：不需要环境，扫一遍代码里的已知陷阱
+python selfcheck.py
+```
+
+测试自带替身，跑完自动清理临时目录，不需要预先配置。
+只有 `test_acp_fileops.py` 例外——它会连真实的 ACP 服务，
+服务不可达时表现为超时（与环境有关，不是代码问题）。
+
+> 测试里用到的相对路径（`Path('ui/main_window.py')` 等）依赖 cwd 是项目根。
+> 所有用例在导入后都会 `chdir` 到项目根，所以从任何目录调用都可以。
 
 ## 从源码构建
 

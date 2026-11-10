@@ -400,7 +400,11 @@ class SnapshotManager:
                     try:
                         with zipfile.ZipFile(zf_path) as zf:
                             for n in zf.namelist():
-                                if n.startswith('primary-runtime'):
+                                # 归档内的路径形如 `config/primary-runtime/...`，
+                                # 不是以 primary-runtime 开头。原判据用 startswith
+                                # 永远匹配不到，会把孤儿完整快照误登记成轻量，
+                                # 进而被当作轻量按 48 个上限清理掉。
+                                if ('primary-runtime' in n.split('/')):
                                     is_full = True
                                     break
                     except Exception:
@@ -571,18 +575,37 @@ class SnapshotManager:
                         if f.exists():
                             shutil.copy2(str(f), str(auth_dst / fname))
                     # Network/Cookies（Chromium SQLite）
+                    # Chromium 运行时以独占句柄持有 Cookies，实测 CreateFileW 带
+                    # FILE_SHARE_READ|WRITE|DELETE 任意组合仍返回 error 32，普通进程
+                    # 无法读取。这是 Windows 的锁语义，不是缺陷。
+                    # 登录态主要存放在 Local Storage（Electron 把 token 放那儿），
+                    # 所以跳过 Cookies 几乎无损失；用 DEBUG 记录，避免每次快照刷一条
+                    # WARNING 把真正的错误淹没（实测一天 138 条）。
+                    skipped_locked = []
                     cookies_dir = auth_src / "Network"
                     if cookies_dir.is_dir():
                         ck = cookies_dir / "Cookies"
                         if ck.exists():
                             (auth_dst / "Network").mkdir(exist_ok=True)
-                            shutil.copy2(str(ck), str(auth_dst / "Network" / "Cookies"))
+                            try:
+                                shutil.copy2(str(ck), str(auth_dst / "Network" / "Cookies"))
+                            except OSError as ck_err:
+                                if getattr(ck_err, "winerror", None) == 32:
+                                    skipped_locked.append("Cookies")
+                                else:
+                                    raise
                     # Local Storage / Session Storage（leveldb）
                     for dname in ("Local Storage", "Session Storage"):
                         d = auth_src / dname
                         if d.is_dir():
                             copy_directory(str(d), str(auth_dst / dname))
-                    ZeroFallLogger.debug("认证态备份完成 -> {}".format(auth_dst))
+                    ZeroFallLogger.debug(
+                        "认证态备份完成 -> {}{}".format(
+                            auth_dst,
+                            "（被独占跳过: {}）".format(", ".join(skipped_locked))
+                            if skipped_locked else ""
+                        )
+                    )
             except Exception as e:
                 ZeroFallLogger.warning("认证态备份失败（不影响主快照）: {}".format(e))
             

@@ -50,7 +50,7 @@
 
 **通道目录**推荐用百度网盘同步盘（跨机器天然可达）：
 ```
-E:\BaiduSyncdisk\zerofall-ctl\
+<同步盘>\zerofall-ctl\
 ├── reports\<agent_id>\*.json     子控写
 ├── processed\*.done               主控标记已处理
 ├── updates\index.json             最新版本指针
@@ -241,7 +241,7 @@ DeepSeek 异常退出（进程退出码 ≠ 0 或 crash 日志）
 | 用途 | 路径 |
 |---|---|
 | 快照库 | `<快照目录>\` |
-| 云端同步 | `E:\BaiduSyncdisk\zerofall-snapshots\` |
+| 云端同步 | `<同步盘>\zerofall-snapshots\` |
 | 日志 | `D:\zerofall\logs\` |
 | 被移走的多余文件 | `<快照目录>\_zerofall_pruned_<时间戳>\` |
 | 单插件备份 | `<快照目录>\plugin_backups\` |

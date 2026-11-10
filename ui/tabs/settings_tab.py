@@ -165,7 +165,9 @@ class SettingsTab(QWidget):
         cloud_layout.addWidget(self.cloud_sync_check, 0, 0, 1, 2)
         
         cloud_layout.addWidget(QLabel("同步目录:"), 1, 0)
-        self.cloud_dir_edit = QLineEdit(getattr(self.config, "cloud_sync_dir", r"E:\BaiduSyncdisk\zerofall-snapshots"))
+        self.cloud_dir_edit = QLineEdit(getattr(self.config, "cloud_sync_dir", "") or "")
+        self.cloud_dir_edit.setPlaceholderText(
+            r"选一个网盘同步目录，例如 <同步盘>\zerofall-snapshots")
         browse_cloud_btn = QPushButton("浏览...")
         browse_cloud_btn.clicked.connect(lambda: self._browse_dir(self.cloud_dir_edit))
         cloud_dir_row = QHBoxLayout()
@@ -340,7 +342,8 @@ class SettingsTab(QWidget):
         chan_box = QGroupBox("传输通道")
         cb = QGridLayout()
         self.channel_edit = QLineEdit(getattr(self.config, 'control_channel_dir', ''))
-        self.channel_edit.setPlaceholderText(r"E:\BaiduSyncdisk\zerofall-ctl")
+        self.channel_edit.setPlaceholderText(
+            r"主控与子控都能访问的共享目录，例如 <同步盘>\zerofall-ctl")
         cb.addWidget(QLabel("共享目录:"), 0, 0)
         cb.addWidget(self.channel_edit, 0, 1, 1, 3)
         _chan_hint = QLabel("主控子控都能访问即可（网盘同步盘 / 局域网共享 / NAS）。"

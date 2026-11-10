@@ -68,7 +68,7 @@ def main():
     'full_snapshot_every_n_light': 6,        # 仅在间隔=0 时生效（计数模式）
         'cloud_overflow_enabled': True,
         'daily_cloud_consolidate': True,
-        'cloud_sync_dir': r'E:\BaiduSyncdisk\zerofall-snapshots',
+        'cloud_sync_dir': '',                    # 留空，由用户在设置页里选同步盘目录
         'cloud_sync_encrypt': True,
     }
     for k, v in defaults.items():

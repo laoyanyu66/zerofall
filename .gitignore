@@ -62,3 +62,16 @@ snapshots/
 *.ico.bak
 # 云端清理计划（本机数据）
 cloud_prune_plan.json
+
+# 测试跑出来的临时工作目录（test_acp_fileops 会建）
+tests/_acp_probe/
+# 源码包输出目录
+dist_release/
+
+# 维护者本地工具，不进仓库
+#   check_open_source.py  内含敏感信息扫描正则
+#   make_source_zip.py    打源码包，路径写死本机
+#   upload_to_github.py   推送脚本，同理
+check_open_source.py
+make_source_zip.py
+upload_to_github.py

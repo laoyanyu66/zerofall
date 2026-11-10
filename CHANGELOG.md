@@ -9,6 +9,62 @@
 
 ---
 
+## [1.5.0] - 2026-11-10
+
+### 变更
+- **测试代码归入 `tests/`**：37 个 `test_*.py` 从仓库根目录移出，
+  根目录只剩 8 个入口/工具脚本。所有测试的 `sys.path` 基准、
+  `HERE`/`ROOT` 变量、以及引用 `ui/`、`modules/`、`ZeroFall.ico`
+  的相对路径都已修正；统一在导入后 `chdir` 到项目根，
+  保证 `Path('ui/main_window.py')` 这类写法仍可用
+
+### 优化
+- **快照打包按文件类型分流压缩**：`.zstd / .tgz / .zip / .png / .whl / .enc`
+  等本来就压缩过的格式改用 `ZIP_STORED` 原样存储。实测一个完整快照里
+  这类数据占约三成，压它们只是白烧 CPU。对照测试（49.9 MB 混合内容）：
+  耗时 **0.75s → 0.27s（-64%）**，包体大小 **27.9 MB → 27.9 MB（不变）**
+- 崩溃快照的状态列补充 tooltip，说明"创建时 DeepSeek 未运行、不参与恢复链、
+  保留供事后分析"，避免用户点了才发现回不去
+
+### 修复
+- **`build_release.py --mode both` 漏了 standalone**：原来只出 master + agent，
+  开源的默认形态反而不在其中。现在 both = 三个全出
+- **版本号散落 5 处且容易漏改**：升到 1.5.0 时界面 `QLabel` 和 User-Agent
+  各漏了一次，靠人工比对才发现。已在 `selfcheck.py` 加第 8 项检查，
+  扫出 `modules/__init__.py`、`build_release.py`、`main.py`、
+  `ui/main_window.py`、`modules/net_transport.py` 五处的版本号，不一致即提示
+- **孤儿完整快照被误判为轻量**：`adopt_orphans` 用
+  `n.startswith('primary-runtime')` 判断，但归档内真实路径是
+  `config/primary-runtime/...`，判据永远为假。索引损坏后重新登记孤儿包时，
+  完整快照会被当轻量登记，进而按 48 个轻量上限被清理掉。
+  改为按路径段匹配后，与索引记录的 11 个完整快照完全一致
+- 设置页「同步目录」默认值与「通道目录」placeholder 写死了开发者本机路径，
+  别人机器上没有那个盘；改为空值 + 通用提示
+- `test_cloud_snapshots.py` 硬编码真实云目录，改为读环境变量 / 部署配置
+- 文档里的示例路径统一脱敏为 `<同步盘>\...`
+
+---
+
+## [1.4.1] - 2026-11-10
+
+### 修复
+- **认证态备份刷屏**：`Network/Cookies` 被 Chromium 以完全不共享的句柄持有，
+  实测 `CreateFileW` 带 `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`
+  任意组合仍返回 `error 32`，普通进程无法读取。原实现每次快照都记一条
+  WARNING（实测一天 138 条，占全部 WARNING 的 60%），把真正的错误淹没了。
+  现按 `winerror == 32` 判定为预期行为并降到 DEBUG，其他异常仍然 WARNING；
+  日志里会写明跳过了哪些文件。
+  影响面很小：登录态主要由 `Local Storage`（Electron 把 token 放那儿）承载，
+  实测认证态备份仍能完整拿到 16 个文件 / 147.7 KB
+- `selfcheck.py` 的 `or <数字>` 检查没跳过文档字符串，把用反引号包裹的示例代码
+  当成真代码报了出来（`ui/main_window.py:2384`）
+
+### 说明
+- 顺带核对全部 18 处 `or <数字>` 用法，均安全：6 处是刻意让 `0` 成为合法值
+  （禁用某功能），3 处端口默认值不会取 0，`stride` 有 `if stride < 1` 兜底
+
+---
+
 ## [1.4.0] - 2026-11-09
 
 ### 新增

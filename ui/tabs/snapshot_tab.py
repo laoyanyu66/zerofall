@@ -564,13 +564,23 @@ class SnapshotTab(QWidget):
             self.snapshot_table.setItem(row, 2, type_item)
             
             # 状态列：健康 / 崩溃
+            # 崩溃快照的语义：创建那一刻 DeepSeek 没在运行（可能是真崩溃，也可能
+            # 只是用户手动关掉了）。这类快照不参与恢复链，也不计入轻量/完整上限
+            # 的编排，只留作现场供事后分析 —— 所以在界面上要说清楚"点了也回不去"。
             if snapshot.status.value != "healthy":
                 label, color = "崩溃", QColor("red")
+                recovery_hint = (
+                    "崩溃点快照（创建时 DeepSeek 未运行）\n"
+                    "不参与恢复链：轻量快照恢复需要健康基线，\n"
+                    "所以这个点目前无法直接回退。\n"
+                    "它保留下来供事后分析崩溃现场。")
             else:
                 label, color = "健康", QColor("green")
+                recovery_hint = "健康快照，可用于恢复"
             status_item = QTableWidgetItem(label)
             status_item.setForeground(color)
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            status_item.setToolTip(recovery_hint)
             self.snapshot_table.setItem(row, 3, status_item)
             
             self.snapshot_table.setItem(row, 4, QTableWidgetItem(str(snapshot.plugin_count)))

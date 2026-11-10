@@ -143,15 +143,39 @@ def copy_directory(src: str, dst: str, ignore_patterns: List[str] = None) -> boo
     except Exception as e:
         return False
 
+# 这些扩展名的内容本身已经是压缩/加密过的（熵很高），再 DEFLATE 几乎不缩小，
+# 只是白烧 CPU。实测一个完整快照里 .zstd 占 26.7%、.tgz/.png/.whl/.enc 再 4%，
+# 合计约三成数据。对它们直接用 ZIP_STORED（原样存储），快照大小基本不变，
+# 创建耗时明显下降。
+# 注意 excludes 里不要放 .exe/.dll/.pyd/.node —— 那些 PE/ELF 还有可观压缩空间
+# （实测整体压缩率约 45%），压它们是值得的。
+_ALREADY_COMPRESSED_EXTS = {
+    '.zip', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.zst', '.zstd', '.br', '.rar', '.lz4', '.whl',
+    '.enc',                                    # 本项目加密后的快照，等于随机数据
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif',
+    '.mp3', '.mp4', '.m4a', '.avi', '.mov', '.mkv', '.webm',
+    '.woff', '.woff2', '.otf',
+}
+
+
+def _is_already_compressed(path) -> bool:
+    return Path(path).suffix.lower() in _ALREADY_COMPRESSED_EXTS
+
+
 def create_archive(source_dir: str, output_path: str, compression: str = "zip") -> bool:
-    """创建压缩包"""
+    """创建压缩包
+
+    逐文件选压缩方式：已压缩格式原样存储，其余 DEFLATE。
+    """
     try:
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(source_dir):
                 for file in files:
                     file_path = Path(root) / file
                     arcname = file_path.relative_to(source_dir)
-                    zipf.write(file_path, arcname)
+                    method = (zipfile.ZIP_STORED if _is_already_compressed(file_path)
+                              else zipfile.ZIP_DEFLATED)
+                    zipf.write(file_path, arcname, compress_type=method)
         return True
     except Exception as e:
         return False

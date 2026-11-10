@@ -2,12 +2,13 @@
 """打包 ZeroFall 发行版
 
   --mode standalone 单体版（开源默认：不连通道、不上报、无主控能力）
---mode master  主控版（含主控/子控全部功能，默认 role=master）
-  --mode agent   子控版（role=agent，打开上报开关，体积一样）
+  --mode master     主控版（含主控/子控全部功能，默认 role=master）
+  --mode agent      子控版（role=agent，打开上报开关，体积一样）
+  --mode both       三个全出（standalone + master + agent）
 
 产出：
   dist/ZeroFall.exe
-  <桌面>/ZeroFall_v<ver>_<mode>.zip   （exe + 源码 + 配置 + 说明）
+  <out>/ZeroFall_v<ver>_<mode>.zip   （exe + 源码 + 配置 + 说明）
 """
 import argparse
 import json
@@ -18,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 SRC = Path(__file__).parent
-VERSION = 'v1.3.0'
+VERSION = 'v1.5.0'
 
 # 发行包包含
 INCLUDE_FILES = [
@@ -151,7 +152,9 @@ if __name__ == '__main__':
     ap.add_argument('--mode', choices=['standalone', 'master', 'agent', 'both'], default='both')
     ap.add_argument('--out', default=r'D:\zerofall')
     args = ap.parse_args()
-    modes = ['master', 'agent'] if args.mode == 'both' else [args.mode]
+    # "both" 原本只出 master + agent，漏了开源的默认形态 standalone。
+    # 现在 both = 三个全出；需要单个就显式指定 --mode。
+    modes = ['standalone', 'master', 'agent'] if args.mode == 'both' else [args.mode]
     for m in modes:
         print('=== 打包 {} 版 ==='.format(m))
         build(m, args.out)

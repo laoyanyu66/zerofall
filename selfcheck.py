@@ -52,6 +52,11 @@ def check_or_zero():
     hits = []
     for p in py_files():
         for i, line in enumerate(p.read_text(encoding='utf-8').splitlines(), 1):
+            # 跳过整行注释、以及文档字符串里用反引号包裹的示例代码
+            # （否则像 "`int(getattr(cfg, 'x', 20) or 20)` 这种说明文字会被误报）
+            stripped = line.strip()
+            if stripped.startswith('#') or '`' in line:
+                continue
             if pat.search(line) and '#' not in line.split('or')[0]:
                 hits.append((p.relative_to(ROOT), i, line.strip()[:96]))
     if hits:
@@ -299,6 +304,56 @@ def check_bare_except_pass():
         print('  [PASS] 没有')
 
 
+def check_version_consistency():
+    """版本号散落在 5 个地方，任何一处漏改都会让界面/UA/包名对不上
+
+    这不是假想问题：1.3.0 升到 1.5.0 时，界面上显示的 QLabel 和发出去的
+    User-Agent 就各漏了一次，靠人工比对才发现。
+    """
+    print('\n[8] 检查版本号一致性')
+    import re
+    # (相对路径, 正则) —— 捕获组 1 只取纯版本号，如 1.5.0
+    spots = [
+        ('modules/__init__.py',      r'__version__\s*=\s*["\']([\d.]+)["\']'),
+        ('build_release.py',         r"VERSION\s*=\s*['\"]v([\d.]+)['\"]"),
+        ('main.py',                  r'setApplicationVersion\(\s*["\']([\d.]+)["\']'),
+        ('ui/main_window.py',        r'QLabel\(\s*["\']v([\d.]+)["\']'),
+        ('modules/net_transport.py', r'ZeroFall-Agent/([\d.]+)'),
+    ]
+    found, missing = {}, []
+    for rel, pat in spots:
+        p = ROOT / rel
+        if not p.exists():
+            missing.append(rel)
+            continue
+        m = re.search(pat, p.read_text(encoding='utf-8'))
+        if m:
+            found[rel] = m.group(1)
+        else:
+            missing.append(rel)
+
+    if not found:
+        WARN.append('version-none')
+        print('  [WARN] 一处版本号都没匹配到（正则可能需要跟着代码改）')
+        return
+
+    versions = sorted(set(found.values()))
+    if len(versions) == 1 and not missing:
+        PASS.append('version')
+        print('  [PASS] {} 处全部一致: v{}'.format(len(found), versions[0]))
+        return
+
+    for rel, v in sorted(found.items()):
+        WARN.append('version {}={}'.format(rel, v))
+        print('  [WARN] {:<28} v{}'.format(rel, v))
+    for rel in missing:
+        WARN.append('version-missing {}'.format(rel))
+        print('  [WARN] {:<28} 未匹配到版本号'.format(rel))
+    if len(versions) > 1:
+        print('  提示：统一成 v{}（modules/__init__.py 的 __version__ 是权威值）'.format(
+            found.get('modules/__init__.py', versions[-1])))
+
+
 if __name__ == '__main__':
     print('=' * 70)
     print('ZeroFall 项目自检')
@@ -310,6 +365,7 @@ if __name__ == '__main__':
     check_dup_functions()
     check_unused_config_fields()
     check_bare_except_pass()
+    check_version_consistency()
     print()
     print('=' * 70)
     print('通过 {} / 提示 {} / 失败 {}'.format(len(PASS), len(WARN), len(FAIL)))
