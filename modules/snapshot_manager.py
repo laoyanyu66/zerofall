@@ -1134,20 +1134,40 @@ class SnapshotManager:
         ]
     
     def get_overflow_snapshots(self):
-        """返回超出本地保留上限的快照 (轻量溢出列表, 完整溢出列表)
-        
+        """返回超出本地保留上限的快照 (轻量溢出, 完整溢出, 崩溃溢出)
+
         每个列表按"最老优先"排序，供云同步归档。
+
+        崩溃快照原先不参与任何溢出判定 —— get_light_snapshots() 和
+        get_full_snapshots() 都硬编码了 status == HEALTHY，crashed 既不算
+        轻量也不算完整，两个上限都管不到，等于永久占用本地磁盘。
+        实测 3 个就吃掉 168 MB。
+
+        更麻烦的是成因：快照状态只看"创建时 DeepSeek 在不在跑"
+        （`HEALTHY if deepseek_proc else CRASHED`）。环境校验不通过时
+        DeepSeek 会拒绝启动，那段时间每 10 分钟的静默快照全被判成 crashed，
+        而且永远不清理 —— 磁盘会无限涨。
+
+        所以给崩溃现场单独一条上限，超出部分同样先归档云端再删本地，
+        本地只留最近 max_crashed_snapshots 个供事后分析。
         """
         max_light = int(getattr(self.config, 'max_light_snapshots', 10))
         max_full = int(getattr(self.config, 'max_full_snapshots', 3))
-        
+        max_crashed = int(getattr(self.config, 'max_crashed_snapshots', 3))
+
         lights = sorted(self.get_light_snapshots(), key=lambda s: s.created_at)
         fulls = sorted(self.get_full_snapshots(), key=lambda s: s.created_at)
-        
-        light_overflow = lights[:-max_light] if len(lights) > max_light else []
-        full_overflow = fulls[:-max_full] if len(fulls) > max_full else []
-        
-        return light_overflow, full_overflow
+        crashes = sorted(self.get_crashed_snapshots(), key=lambda s: s.created_at)
+
+        # 上限为 0 表示这一类不保留（但不是"无限"，别用 or 吞掉 0）
+        light_overflow = lights[:-max_light] if max_light > 0 and len(lights) > max_light else (
+            lights if max_light == 0 else [])
+        full_overflow = fulls[:-max_full] if max_full > 0 and len(fulls) > max_full else (
+            fulls if max_full == 0 else [])
+        crash_overflow = crashes[:-max_crashed] if max_crashed > 0 and len(crashes) > max_crashed else (
+            crashes if max_crashed == 0 else [])
+
+        return light_overflow, full_overflow, crash_overflow
     
     @staticmethod
     def snapshot_date(snapshot: 'SnapshotData') -> str:

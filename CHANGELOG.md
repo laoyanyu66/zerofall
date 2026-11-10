@@ -79,6 +79,18 @@
   各漏了一次，靠人工比对才发现。已在 `selfcheck.py` 加第 8 项检查，
   扫出 `modules/__init__.py`、`build_release.py`、`main.py`、
   `ui/main_window.py`、`modules/net_transport.py` 五处的版本号，不一致即提示
+- **崩溃快照永久占本地磁盘**
+  `get_light_snapshots()` / `get_full_snapshots()` 都硬编码 `status == HEALTHY`，
+  而 `get_overflow_snapshots()` 只从这两个列表取溢出——crashed 快照既不算
+  轻量也不算完整，两个上限都管不到，只能永久留着。实测 3 个占了 168 MB。
+  成因更值得说：状态只看"创建时 DeepSeek 在不在跑"
+  （`HEALTHY if deepseek_proc else CRASHED`）。环境校验不通过时 DeepSeek
+  会拒绝启动，那段时间每个静默快照都会被判成 crashed，而且永远不清理——
+  等于磁盘无限涨。
+  现在给崩溃现场单独一条上限 `max_crashed_snapshots`（默认 3），
+  超出部分先归档云端再删本地，本地留最近几个供事后分析。
+  `get_overflow_snapshots()` 相应改为返回 (轻量, 完整, 崩溃) 三元组
+
 - **改了排除规则后健康度持续红**
   MD5 基线是某次 `update_baseline()` 按当时的排除规则生成的，之后往
   `MD5_EXCLUDE_FILES` 里加新条目，旧基线不会自动更新——里面仍存着

@@ -217,7 +217,8 @@ def test_archive_fail_cap():
             return []
 
         def get_overflow_snapshots(self):
-            return [Snap('bad-1')], []
+            # 与 SnapshotManager 保持一致：返回 (轻量, 完整, 崩溃) 三元组
+            return [Snap('bad-1')], [], []
 
         def delete_snapshot(self, sid):
             self.deleted.append(sid)

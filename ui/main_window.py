@@ -1731,15 +1731,19 @@ class ZeroFallMainWindow(QMainWindow):
             except Exception as e:
                 ZeroFallLogger.warning("[生命周期] 孤儿索引清理失败: {}".format(e))
             
-            light_overflow, full_overflow = self.snapshot_manager.get_overflow_snapshots()
-            overflow = light_overflow + full_overflow
+            light_overflow, full_overflow, crash_overflow = \
+                self.snapshot_manager.get_overflow_snapshots()
+            # 崩溃快照也纳入归档：它们不参与轻量/完整的恢复链，原来两个
+            # 上限都管不到，会永久占本地磁盘（实测 3 个 168 MB）。
+            overflow = light_overflow + full_overflow + crash_overflow
             if not overflow:
                 return
             
             self._archive_busy = True
             ZeroFallLogger.info(
-                "[生命周期] 本地溢出 {} 个快照（轻量 {} / 完整 {}），开始云归档".format(
-                    len(overflow), len(light_overflow), len(full_overflow)
+                "[生命周期] 本地溢出 {} 个快照（轻量 {} / 完整 {} / 崩溃 {}），开始云归档".format(
+                    len(overflow), len(light_overflow), len(full_overflow),
+                    len(crash_overflow)
                 )
             )
             
