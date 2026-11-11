@@ -563,9 +563,15 @@ class ConfigManager:
                         if p is not None:
                             if field == 'deepseek_exe_path':
                                 valid = p.is_file()
-                            elif field in ('deepseek_plugins_dir', 'deepseek_config_dir', 'dsh_appdata_dir'):
-                                # dsh_appdata_dir 目录可后建，但路径得是个字符串
-                                valid = bool(current)
+                            elif field in ('deepseek_plugins_dir', 'deepseek_config_dir'):
+                                # 这两个目录必须真的存在：换机器后旧用户名
+                                # (C:\Users\旧名\.dsh) 或旧盘符 (Z:\...\runtime)
+                                # 只剩个非空字符串，光判断非空会一直留着坏路径，
+                                # 于是探测到的正确值永远写不进去。
+                                valid = p.is_dir()
+                            elif field == 'dsh_appdata_dir':
+                                # appdata 目录首次运行会自动创建，但盘符得可用
+                                valid = bool(current) and self._drive_available(current)
                             else:
                                 # 快照/云目录：目录可不存在（会自动创建），但盘符必须可用
                                 valid = self._drive_available(current)

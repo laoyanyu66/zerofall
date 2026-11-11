@@ -72,3 +72,7 @@ print('最终:', '全部通过' if ok else '存在失败')
 # 清理
 shutil.rmtree(tmp, ignore_errors=True)
 print('临时目录已清理')
+
+# 之前这里无论如何都返回 0，批量跑测试时"存在失败"被当成通过，
+# 跨机自适应的回归就一直没被发现（插件目录/配置目录的修复缺口）。
+sys.exit(0 if ok else 1)

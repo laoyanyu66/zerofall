@@ -79,14 +79,22 @@ def test_crash_but_running():
 
 
 def test_crash_and_not_running():
-    print('\n[3] 有崩溃标记，DeepSeek 未运行 → FAILED')
+    print('\n[3] 有崩溃标记，DeepSeek 未运行 → WARNING（不拦截启动）')
+    # 语义在 1.5.1 改过：这里原先断言 FAILED，但 FAILED 会触发
+    # "环境校验失败 → 拒绝启动 DeepSeek"，而唯一的修复动作就是启动它，
+    # 结果崩溃一次之后再也起不来（实测日志 15:36:48 ERROR 拒绝启动）。
+    # 现在降级成 WARNING 放行启动，启动成功后下一次校验会清标记。
+    # 相应地在 environment_checker.check_last_exit() 里有注释说明。
     sd = Path(_tmp) / 's3'
     ec, sf = make_checker(
         sd, {'last_exit_code': 1, 'last_exit_crash': True})
     with mock.patch('modules.environment_checker.get_process_info',
                     return_value=None):
         item = ec.check_last_exit()
-    check('结果为 FAILED', item.result == CheckResult.FAILED,
+    check('结果为 WARNING', item.result == CheckResult.WARNING,
+          '实得 {}'.format(item.result))
+    check('结果不是 FAILED（否则会拦住启动）',
+          item.result != CheckResult.FAILED,
           '实得 {}'.format(item.result))
     check('提示当前未运行', '未运行' in item.message)
     state = json.loads(sf.read_text(encoding='utf-8'))
