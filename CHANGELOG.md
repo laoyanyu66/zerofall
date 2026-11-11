@@ -9,6 +9,55 @@
 
 ---
 
+## [1.5.2] - 2026-11-11
+
+早上一轮自检（`selfcheck.py` + 37 个测试全跑）挖出来的问题。selfcheck 本身
+0 失败，问题都在它查不到的缝隙里：测试自己吞掉失败、日志被测试污染、
+换机器路径自愈只做了一半。
+
+### 修复
+
+- **跨机路径自愈只修一半：`.dsh` 与 `runtime` 目录永远修不掉**
+  `ConfigManager.load()` 里"当前值是否有效"对 `deepseek_plugins_dir`、
+  `deepseek_config_dir`、`dsh_appdata_dir` 只判 `bool(current)` —— 非空字符串
+  就算有效。换机器后旧用户名路径 `C:\Users\旧名\.dsh`、已拔掉的盘符
+  `Z:\NoSuchDrive\resources\runtime` 都是"非空的坏路径"，于是探测到的正确值
+  永远写不进去，程序抱着坏路径继续跑。改为：两个目录必须 `is_dir()`，
+  `dsh_appdata_dir` 要求盘符可用（目录本身可首次运行创建）。
+  这是 `test_crossmachine.py` 一直在报的两个 FAIL。
+
+- **`test_crossmachine.py` 无论如何都返回 0**
+  断言失败只打印"最终: 存在失败"然后正常退出，批量跑测试时这个回归一直被
+  当成通过 —— 上面那个缺口就是这样活下来的。现在失败即 `sys.exit(1)`。
+
+- **`test_exit_state.py` 断言与 1.5.1 的语义相反**
+  1.5.1 已把「有崩溃标记 + 当前没在运行」从 FAILED 降级成 WARNING：
+  报 FAILED 会走进"环境校验失败 → 拒绝启动 DeepSeek"，而唯一的修复动作
+  就是启动它，等于崩一次之后再起不来（1.5.1 注释里记着实测日志
+  `15:36:48 ERROR 环境校验失败，拒绝启动DeepSeek`）。测试还在断言 FAILED，
+  现在按现行语义断言 WARNING，并额外断言"不是 FAILED"。
+
+### 变更
+
+- **测试日志与生产日志分离**
+  测试会 import 主程序模块触发日志初始化，而日志目录按 cwd 算，测试又把
+  cwd 切到项目根 —— 跑一遍测试就往生产日志 `logs/zerofall_YYYYMMDD.log`
+  里灌假退出码 1/2/3/9、假 sha256 不匹配、假"无可用快照"。真排障时
+  噪音比线索多。现在 `logger.py` 检测到进程是 `tests/` 下的 `test_*.py`
+  就落 `logs/_tests/`，生产日志只留真事件；需要指到别处用环境变量
+  `ZF_LOG_DIR`。
+
+### 说明
+
+- 自检残留的 18 条 `or <数字>` 提示核对过：12 条是 `or 0`（0 仍是 0，无害），
+  6 条是 `or` 非零默认值（`ftp_port or 21`、`http_port or 8765`、
+  `log_backup_count or 5`、`control_poll_seconds or 60`）。端口 0 在界面上
+  本就设不了（1024–65535），控制轮询另有 `max(15, …)` 兜底，影响面窄，未改
+- 11/10 日志里那条 `找不到 node: …\.dsh\dsh-runtimes\…\node.exe` 复现不了，
+  该文件当前存在
+
+---
+
 ## [1.5.1] - 2026-11-10
 
 上午跑了一轮实测，暴露三个会慢慢吃掉磁盘的问题，都不是崩给用户看的，

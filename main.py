@@ -346,7 +346,7 @@ def main():
         print("[警告] 设置应用图标失败: {}".format(_e))
 
     app.setApplicationName("ZeroFall")
-    app.setApplicationVersion("1.5.1")
+    app.setApplicationVersion("1.5.2")
     
     # 全局异常钩子：子控角色下自动上报给主控
     _install_error_reporter()

@@ -8,6 +8,25 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 
+
+def _is_test_run() -> bool:
+    """判断当前进程是不是在跑 tests/ 下的测试脚本
+
+    为什么要单独判：测试会 import 主程序模块并触发日志初始化，而日志目录
+    按 cwd 计算，测试又都把 cwd 切到项目根 —— 于是 run 一遍测试就往生产日志
+    logs/zerofall_YYYYMMDD.log 里灌进一堆假故障（假退出码 1/2/3/9、
+    假 sha256 不匹配、假"无可用快照"）。真出问题时翻当天日志，噪音比线索多。
+    测试进程单独落 logs/_tests/，生产日志只剩真事件。
+    """
+    try:
+        argv0 = Path(sys.argv[0]).resolve()
+    except Exception:
+        return False
+    if argv0.stem.lower().startswith('test_'):
+        return True
+    return len(argv0.parts) >= 2 and argv0.parts[-2].lower() == 'tests'
+
+
 class ZeroFallLogger:
     """ZeroFall日志管理器"""
     
@@ -31,6 +50,12 @@ class ZeroFallLogger:
             base_dir = Path(sys.executable).parent
         else:
             base_dir = Path.cwd()
+        # 日志目录优先级：ZF_LOG_DIR 环境变量 > 测试进程单独目录 > logs
+        env_dir = os.environ.get('ZF_LOG_DIR', '').strip()
+        if env_dir:
+            log_dir = env_dir
+        elif not getattr(sys, 'frozen', False) and _is_test_run():
+            log_dir = 'logs/_tests'
         self.log_dir = (base_dir / log_dir).resolve()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         ZeroFallLogger._log_dir = self.log_dir      # 供 cleanup_old_logs 使用

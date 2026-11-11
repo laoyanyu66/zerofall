@@ -533,7 +533,7 @@ class ZeroFallMainWindow(QMainWindow):
         brand.setObjectName('brand')
         row.addWidget(brand)
 
-        ver = QLabel("v1.5.1")
+        ver = QLabel("v1.5.2")
         ver.setObjectName('mute')
         row.addWidget(ver)
 

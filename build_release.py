@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 SRC = Path(__file__).parent
-VERSION = 'v1.5.1'
+VERSION = 'v1.5.2'
 
 # 发行包包含
 INCLUDE_FILES = [
