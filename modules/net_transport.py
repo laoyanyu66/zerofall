@@ -36,6 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
+from utils import config_int
+
 API_PREFIX = '/zf'
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024      # 上报正文上限 2 MB
 CHUNK = 256 * 1024
@@ -865,7 +867,7 @@ def make_relay(config):
                                  'ftp_agent_user', 'ftp_agent_password')
             return FtpChannel(
                 host, _fu, _fp,
-                getattr(config, 'ftp_port', 21) or 21,
+                config_int(config, 'ftp_port', 21),
                 getattr(config, 'relay_root', '/zerofall-ctl') or '/zerofall-ctl',
                 getattr(config, 'ftp_tls', False),
             )
@@ -921,7 +923,7 @@ class HttpControlChannel:
 
     # ── 底层请求 ────────────────────────────────────────────
     def _headers(self):
-        h = {'User-Agent': 'ZeroFall-Agent/1.5.2'}
+        h = {'User-Agent': 'ZeroFall-Agent/1.6.0'}
         if self.token:
             h['X-ZF-Token'] = self.token
         return h

@@ -6,3 +6,4 @@ watchdog>=3.0.0
 python-dateutil>=2.8.2
 pypiwin32>=223; sys_platform == 'win32'
 wmi>=1.5.1; sys_platform == 'win32'
+PyYAML>=6.0              # 配置编辑：解析 profile 补丁（!!js 表达式）

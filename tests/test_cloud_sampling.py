@@ -76,6 +76,9 @@ class H:
 
     _pick_sampled_snapshots = MW.ZeroFallMainWindow._pick_sampled_snapshots
     _prune_cloud_history = MW.ZeroFallMainWindow._prune_cloud_history
+    # 体量上限清理（日期清理之后会调它）：这里绑真实实现，配置默认上限 8 GB，
+    # 测试造的文件只有几百字节，因此它一定返回 0，不影响"按天删"的断言。
+    _prune_cloud_by_size = MW.ZeroFallMainWindow._prune_cloud_by_size
     # 注意：这个在原类里是 @staticmethod，直接赋值会变成普通函数，
     # 通过实例调用时会多绑一个 self 导致 TypeError（被清理函数的
     # except 吞掉，表现为"没删任何文件"）。必须包一层 staticmethod。

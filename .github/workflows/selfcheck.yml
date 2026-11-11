@@ -1,0 +1,43 @@
+name: selfcheck
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装最小依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+      - name: 静态自检（陷阱扫描 + 版本一致性 + 配置重复）
+        run: python selfcheck.py
+      - name: 不依赖 GUI 的单元测试
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($t in @(
+            'tests/test_dsh_config.py',
+            'tests/test_config_bundle.py',
+            'tests/test_config_bundle_crypto.py',
+            'tests/test_profile_health.py',
+            'tests/test_session_repair.py',
+            'tests/test_env_sanitize.py',
+            'tests/test_retention_plan.py',
+            'tests/test_sessions_scope.py'
+          )) {
+            if (Test-Path $t) {
+              Write-Host "== $t"
+              python $t
+              if ($LASTEXITCODE -ne 0) { $failed += $t }
+            }
+          }
+          if ($failed.Count -gt 0) { throw "失败: $($failed -join ', ')" }

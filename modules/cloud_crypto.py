@@ -74,10 +74,8 @@ def is_using_legacy(config=None) -> bool:
 
 
 def encrypt_snapshot(src_path, dst_path, config=None) -> bool:
-    """加密单个快照文件（用本机随机密码）"""
-    from utils import encrypt_file
-    return bool(encrypt_file(str(src_path), str(dst_path),
-                             get_cloud_password(config)))
+    """加密单个快照文件（本机随机密码，ZFCH1 二进制容器）"""
+    return encrypt_snapshot_v2(src_path, dst_path, config)
 
 
 def decrypt_snapshot(src_path, dst_path, config=None):
@@ -92,6 +90,12 @@ def decrypt_snapshot(src_path, dst_path, config=None):
     from utils import decrypt_file
 
     pw = get_cloud_password(config)
+    if is_v2(src_path):
+        if decrypt_file_v2(str(src_path), str(dst_path), pw):
+            return True, 'current'
+        if pw != LEGACY_PASSWORD and decrypt_file_v2(str(src_path), str(dst_path), LEGACY_PASSWORD):
+            return True, 'legacy'
+        return False, 'failed'
     try:
         if decrypt_file(str(src_path), str(dst_path), pw):
             return True, 'current'
@@ -120,3 +124,121 @@ def describe(config=None) -> str:
     kind = "配置指定" if (config is not None and
                           getattr(config, 'cloud_encrypt_password', '')) else "本机随机"
     return "加密密码 = {}（{} 位）".format(kind, len(pw))
+
+# ─────────────────────────────────────────────── 二进制容器（ZFCH1）
+
+# 为什么加这个：Fernet（AES-CBC + HMAC）输出前还要 base64，实测 120.9 MB 的
+# 快照加密后 161.2 MB（×1.33）。云端 1.6 GB 有效载荷就白扔 400 MB。
+# ZFCH1 用 AES-256-GCM 分块（每块 4 MB）+ 二进制帧，开销只有几十字节/块，
+# 同时保持"分块 = 内存恒定"这个原始设计目标。
+
+V2_MAGIC = b"ZFCH1\n"
+V2_CHUNK = 4 * 1024 * 1024
+V2_SCRYPT = (2 ** 14, 8, 1)
+
+
+def is_v2(path) -> bool:
+    """是不是二进制容器（否则按老的 Fernet 文本处理）"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(V2_MAGIC)) == V2_MAGIC
+    except OSError:
+        return False
+
+
+def payload_ratio(path, plain_size: int) -> float:
+    """密文/明文比：给界面显示"实际占用"用"""
+    try:
+        import os
+        enc = os.path.getsize(str(path))
+        return round(enc / plain_size, 3) if plain_size else 1.0
+    except OSError:
+        return 1.0
+
+
+def _derive_key(password: str, salt: bytes, n: int, r: int, p: int) -> bytes:
+    import hashlib
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
+
+
+def _nonce(prefix: bytes, counter: int) -> bytes:
+    return prefix + counter.to_bytes(4, "big")
+
+
+def encrypt_file_v2(src_path, dst_path, password: str) -> bool:
+    """分块加密成 ZFCH1 容器（内存占用 ≈ 一块）"""
+    import base64, json, os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    try:
+        salt = os.urandom(16)
+        prefix = os.urandom(8)
+        n, r, p = V2_SCRYPT
+        key = _derive_key(password, salt, n, r, p)
+        aead = AESGCM(key)
+        header = {"kdf": "scrypt", "n": n, "r": r, "p": p,
+                  "salt": base64.b64encode(salt).decode("ascii"),
+                  "nonce_prefix": base64.b64encode(prefix).decode("ascii"),
+                  "chunk": V2_CHUNK, "v": 2}
+        hb = json.dumps(header).encode("utf-8")
+        with open(str(src_path), "rb") as fin, open(str(dst_path), "wb") as fout:
+            fout.write(V2_MAGIC)
+            fout.write(len(hb).to_bytes(4, "big"))
+            fout.write(hb)
+            counter = 0
+            while True:
+                chunk = fin.read(V2_CHUNK)
+                if not chunk:
+                    fout.write((0).to_bytes(4, "big"))     # EOF 标记
+                    break
+                ct = aead.encrypt(_nonce(prefix, counter), chunk, None)
+                fout.write(len(ct).to_bytes(4, "big"))
+                fout.write(ct)
+                counter += 1
+        return True
+    except Exception:
+        try:
+            os.unlink(str(dst_path))
+        except OSError:
+            pass
+        return False
+
+
+def decrypt_file_v2(src_path, dst_path, password: str) -> bool:
+    """解开 ZFCH1 容器；密码错/被改动都会在这里失败"""
+    import base64, json, os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    try:
+        with open(str(src_path), "rb") as fin, open(str(dst_path), "wb") as fout:
+            if fin.read(len(V2_MAGIC)) != V2_MAGIC:
+                return False
+            hlen = int.from_bytes(fin.read(4), "big")
+            header = json.loads(fin.read(hlen).decode("utf-8"))
+            salt = base64.b64decode(header["salt"])
+            prefix = base64.b64decode(header["nonce_prefix"])
+            key = _derive_key(password, salt, int(header["n"]), int(header["r"]), int(header["p"]))
+            aead = AESGCM(key)
+            counter = 0
+            while True:
+                raw = fin.read(4)
+                if len(raw) < 4:
+                    return False
+                size = int.from_bytes(raw, "big")
+                if size == 0:
+                    break
+                ct = fin.read(size)
+                if len(ct) != size:
+                    return False
+                fout.write(aead.decrypt(_nonce(prefix, counter), ct, None))
+                counter += 1
+        return True
+    except Exception:
+        try:
+            os.unlink(str(dst_path))
+        except OSError:
+            pass
+        return False
+
+
+def encrypt_snapshot_v2(src_path, dst_path, config=None) -> bool:
+    return encrypt_file_v2(str(src_path), str(dst_path), get_cloud_password(config))
+

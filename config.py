@@ -94,6 +94,7 @@ class ZeroFallConfig:
     # 主控自己当更新服务器，子控只填一个地址，不需要第三方账号或共享网盘。
     http_server_enabled: bool = True           # 主控是否启动内建更新服务器
     http_port: int = 8765                      # 监听端口
+    http_bind: str = "127.0.0.1"               # 监听地址（默认只听回环；子控在主控同网段才改 0.0.0.0）
     http_token: str = ""                       # 可选共享密钥（子控与主控填一样）
     master_url: str = ""                       # 子控填主控地址，如 http://192.168.1.10:8765
     # master_url 非空时子控优先走 HTTP；留空则退回共享目录方式
@@ -135,7 +136,10 @@ class ZeroFallConfig:
     # 备份内容配置
     backup_plugins: bool = True               # 备份插件目录
     backup_plugin_config: bool = True         # 备份插件配置
-    backup_session_data: bool = False         # 备份会话数据（默认关闭）
+    backup_session_data: bool = True          # 备份会话数据（默认开启：崩溃回滚不带上对话等于没回滚）
+    # 会话只在完整快照里带：轻量快照每 10 分钟一份，会话 30 MB 全塞进去会把轻量从 24 MB 抬到 54 MB。
+    # 会话是"完整基线"级别的数据（每 30 分钟的完整快照带上即可），精细恢复点不需要它。
+    sessions_only_in_full: bool = True
     backup_keys: bool = False                 # 备份密钥配置（默认关闭，隐私安全）
     
     # 百度网盘配置
@@ -157,7 +161,10 @@ class ZeroFallConfig:
     cloud_sync_light_stride: int = 12         # 轻量快照每 N 个上传 1 个
     cloud_sync_full_stride: int = 4           # 完整快照每 N 个上传 1 个
     # 云端历史保留期：超过这么多天的整组快照会被清掉，0 = 不限（会无限长）
-    cloud_history_keep_days: int = 14         # 默认留两周
+    cloud_history_keep_days: int = 14
+    # 云端体量上限（GB）：只按天数留会失控 —— 一次事故就能塞进 10 GB 并躺满两周。
+    # 超过上限时从最旧的完整快照开始删，直到降到上限以下。0 = 不限。
+    cloud_max_total_gb: float = 8.0         # 默认留两周
     cloud_sync_encrypt: bool = True           # 上传前 AES 加密（默认开启，恢复时用「导入加密快照」）
     
     # 前置校验配置
@@ -212,6 +219,12 @@ class ZeroFallConfig:
         """
         if not self.snapshot_dir:
             self.snapshot_dir = self._probe_snapshot_dir()
+        # 会话目录：空则跟着 DSH_HOME 走（2026-11-11 的"Path('')=cwd"事故之后，
+        # 空值不再意味着"用当前目录"，而是"用 <DSH_HOME>/sessions"）
+        if not self.deepseek_session_dir and self.deepseek_plugins_dir:
+            cand = Path(self.deepseek_plugins_dir) / "sessions"
+            if cand.is_dir():
+                self.deepseek_session_dir = str(cand)
 
     @staticmethod
     def _probe_snapshot_dir() -> str:
@@ -565,7 +578,7 @@ class ConfigManager:
                                 valid = p.is_file()
                             elif field in ('deepseek_plugins_dir', 'deepseek_config_dir'):
                                 # 这两个目录必须真的存在：换机器后旧用户名
-                                # (C:\Users\旧名\.dsh) 或旧盘符 (Z:\...\runtime)
+                                # (C:\Users\<旧用户名>\.dsh) 或旧盘符 (Z:\...\runtime)
                                 # 只剩个非空字符串，光判断非空会一直留着坏路径，
                                 # 于是探测到的正确值永远写不进去。
                                 valid = p.is_dir()

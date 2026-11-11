@@ -37,10 +37,10 @@ from modules.guardian import Guardian
 from modules.baidu_pan import BaiduPanClient
 from ui.native_tray import NativeTrayIcon
 from ui import theme as th
-from utils import set_directory_readonly, format_timestamp
+from utils import set_directory_readonly, format_timestamp, config_int
 
 # 导入拆分后的 Tab 类
-from ui.tabs import DashboardTab, SnapshotTab, EnvTab, CloudTab, SettingsTab, PluginTab
+from ui.tabs import DashboardTab, SnapshotTab, EnvTab, CloudTab, SettingsTab, PluginTab, ConfigTab
 # 统一风格对话框：外观与主界面同源，调用形状与 QMessageBox 一致
 from ui.dialogs import ZFMessageBox as QMessageBox
 
@@ -64,6 +64,21 @@ class ZeroFallMainWindow(QMainWindow):
         
         # 初始化核心模块
         self.snapshot_manager = SnapshotManager(self.config)
+        # 保留策略 vs 盘面对账（2026-11-11 自检发现配置与实际差了三倍没人知道）
+        try:
+            from modules import diagnostics as _diag
+            _rec = _diag.retention_reconcile(self.config)
+            if _rec.get("notes"):
+                ZeroFallLogger.warning("[保留策略] {} | 盘上 {} 份 / {:.2f} GB，稳态预计 {:.2f} GB".format(
+                    "；".join(_rec["notes"]), _rec["disk"]["total"],
+                    _rec["disk"]["size_gb"], _rec.get("steady_state_gb", 0)))
+            else:
+                ZeroFallLogger.info("[保留策略] 配置与盘面一致：{} 份 / {:.2f} GB，稳态预计 {:.2f} GB".format(
+                    _rec.get("disk", {}).get("total", 0),
+                    _rec.get("disk", {}).get("size_gb", 0),
+                    _rec.get("steady_state_gb", 0)))
+        except Exception as _e:
+            ZeroFallLogger.debug("[保留策略] 对账跳过: {}".format(_e))
         self.env_checker = EnvironmentChecker(self.config, self.snapshot_manager)
         self.guardian = Guardian(self.config, self.env_checker, self.snapshot_manager)
         self.baidu_pan = BaiduPanClient(self.config) if self.config.baidu_pan_enabled else None
@@ -189,6 +204,14 @@ class ZeroFallMainWindow(QMainWindow):
         self.plugin_tab = PluginTab(self.config, self.snapshot_manager)
         self.tab_widget.addTab(self._scrollable(self.plugin_tab, 620), "插件管理")
         
+        # 配置编辑标签页：融合 dsh-config-editor 的能力（改 profile 补丁）
+        try:
+            self.config_tab = ConfigTab(self.config, self.snapshot_manager, main_window=self)
+            self.tab_widget.addTab(self._scrollable(self.config_tab, 620), "配置编辑")
+        except Exception as _e:
+            self.config_tab = None
+            ZeroFallLogger.warning("[配置编辑] 页签初始化失败: {}".format(_e))
+
         # 环境校验标签页
         self.env_tab = EnvTab(self.config, self.env_checker)
         self.tab_widget.addTab(self._scrollable(self.env_tab, 620), "环境校验")
@@ -533,7 +556,7 @@ class ZeroFallMainWindow(QMainWindow):
         brand.setObjectName('brand')
         row.addWidget(brand)
 
-        ver = QLabel("v1.5.2")
+        ver = QLabel("v1.6.0")
         ver.setObjectName('mute')
         row.addWidget(ver)
 
@@ -783,7 +806,7 @@ class ZeroFallMainWindow(QMainWindow):
         # 定时完整快照：每 60 秒检查一次"距上个完整快照是否已满 N 分钟"。
         # 用 60 秒轮询而不是直接按 N 分钟起定时器，是因为完整快照也可能由
         # 首启/手动/版本变化触发，轮询"按实际最后一次"算才不会被绕乱。
-        _fi = int(getattr(self.config, 'full_snapshot_interval_minutes', 30) or 0)
+        _fi = config_int(self.config, 'full_snapshot_interval_minutes', 30)
         if _fi > 0:
             self._full_check_timer = QTimer(self)
             self._full_check_timer.timeout.connect(self._check_full_snapshot_interval)
@@ -865,6 +888,11 @@ class ZeroFallMainWindow(QMainWindow):
             
             # 若 DeepSeek 进程仍在运行，先杀掉，再延迟 1.5s 触发自愈
             # （不能在主线程 sleep，否则 Windows 直接判"无响应"）
+            try:
+                from modules import fault_timeline as _ftl
+                _ftl.record_crash("DSH 崩溃日志新增 {} 个".format(len(new_crashes)))
+            except Exception:
+                pass
             if self.guardian.is_deepseek_running():
                 ZeroFallLogger.info("[崩溃监控] 终止异常运行的 DeepSeek")
                 # 这次 kill 是自愈动作，不能让 on_exit_callback 把 ZeroFall 一起带走
@@ -1092,7 +1120,7 @@ class ZeroFallMainWindow(QMainWindow):
         没必要再往回补传。
         """
         try:
-            stride = int(getattr(self.config, cfg_field, default_stride) or 0)
+            stride = config_int(self.config, cfg_field, default_stride)
         except Exception:
             stride = default_stride
         if stride < 1:
@@ -1308,7 +1336,7 @@ class ZeroFallMainWindow(QMainWindow):
                 logs = 0
                 try:
                     logs = ZeroFallLogger.cleanup_old_logs(
-                        keep_days=int(getattr(self.config, 'log_backup_count', 5) or 5))
+                        keep_days=config_int(self.config, 'log_backup_count', 5))
                 except Exception:
                     logs = 0
                 if pruned or adopted or dirs or bad or logs:
@@ -1419,7 +1447,7 @@ class ZeroFallMainWindow(QMainWindow):
         正是"以首个完整快照时间为基准、每隔 N 分钟一个"。
         """
         try:
-            interval = int(getattr(self.config, 'full_snapshot_interval_minutes', 30) or 0)
+            interval = config_int(self.config, 'full_snapshot_interval_minutes', 30)
         except Exception:
             interval = 30
         if interval <= 0:
@@ -1648,7 +1676,7 @@ class ZeroFallMainWindow(QMainWindow):
         # 2) 完整快照触发：定时模式下由 _check_full_snapshot_interval 负责，
         #    这里仅在定时模式关闭（interval<=0）时退回"每 N 个轻量"老逻辑
         try:
-            _fi = int(getattr(self.config, 'full_snapshot_interval_minutes', 30) or 0)
+            _fi = config_int(self.config, 'full_snapshot_interval_minutes', 30)
         except Exception:
             _fi = 30
         if _fi > 0:
@@ -1785,6 +1813,14 @@ class ZeroFallMainWindow(QMainWindow):
                         ZeroFallLogger.warning(
                             "[生命周期] 快照 {} 连续 {} 次云归档失败，"
                             "停止重试（请检查云同步盘可用性）".format(sid, MAX_FAIL))
+                        # 放弃重试 + 保留本地 = 永久占用。归档不可能成功的这批，
+                        # 超过本地硬上限的按最老优先丢掉，否则就是 2026-11-11 那次
+                        # 堆到 83 GB、把 D: 写到 0 的翻版。
+                        try:
+                            self._drop_if_beyond_hard_cap(s)
+                        except Exception as _e:
+                            ZeroFallLogger.warning(
+                                "[生命周期] 硬上限降级删除失败 {}: {}".format(sid, _e))
                     else:
                         ZeroFallLogger.warning(
                             "[生命周期] 快照 {} 云归档失败，保留本地（第 {}/{} 次）".format(
@@ -1795,6 +1831,37 @@ class ZeroFallMainWindow(QMainWindow):
         finally:
             self._archive_busy = False
     
+    def _drop_if_beyond_hard_cap(self, snapshot) -> bool:
+        """归档彻底失败后的降级出口：超出本地硬上限的快照直接丢
+
+        正常路径是「溢出 → 云归档 → 删本地」。云归档连续 3 次失败后，原来的实现
+        只是停止重试并保留本地 —— 于是这批快照既不会归档、也不会被删，
+        只能靠磁盘满来收场（2026-11-11：30 份 83 GB，D: 可用 0.00 GB）。
+
+        这里复用 SnapshotManager.plan_retention 的判定（2 倍上限窗口，
+        永久保留最新一份完整 + 最新一份轻量），只有确实超窗口的才删。
+        """
+        try:
+            from modules.snapshot_manager import plan_retention, _int_opt
+        except Exception:
+            return False
+        sm = self.snapshot_manager
+        max_light = _int_opt(getattr(self.config, 'max_light_snapshots', 0), 0)
+        max_full = _int_opt(getattr(self.config, 'max_full_snapshots', 0), 0)
+        doomed = plan_retention(
+            sm.snapshots,
+            max_light * 2 if max_light > 0 else 0,
+            max_full * 2 if max_full > 0 else 0,
+            protected_ids=set(getattr(sm, 'retention_protected_ids', None) or ()),
+        )
+        sid = getattr(snapshot, 'snapshot_id', '')
+        if sid and sid in doomed and sm.delete_snapshot(sid):
+            self._archive_fail_count.pop(sid, None)
+            ZeroFallLogger.warning(
+                "[生命周期] 快照 {} 无法云归档且超出本地硬上限，已删除本地副本".format(sid))
+            return True
+        return False
+
     def _archive_snapshot_to_cloud(self, snapshot, sync_dir: Path, encrypt: bool) -> bool:
         """把单个快照归档到云同步盘（复用加密同步逻辑，不触发云清理）"""
         try:
@@ -1886,7 +1953,7 @@ class ZeroFallMainWindow(QMainWindow):
         云端归档该有保留期，否则网盘迟早被塞满，而用户根本不会去看。
         """
         try:
-            keep_days = int(getattr(self.config, 'cloud_history_keep_days', 14) or 0)
+            keep_days = config_int(self.config, 'cloud_history_keep_days', 14)
         except Exception:
             keep_days = 14
         if keep_days <= 0:
@@ -1926,7 +1993,51 @@ class ZeroFallMainWindow(QMainWindow):
         else:
             ZeroFallLogger.info(
                 "[云端历史] 无需清理（保留期内无过期文件，保留 {} 天）".format(keep_days))
+        removed += self._prune_cloud_by_size(sync_dir)
         return removed
+
+    def _prune_cloud_by_size(self, sync_dir: Path) -> int:
+        """云端体量上限：超过 cloud_max_total_gb 就从最旧的完整快照开始删
+
+        只按天数留是失控的：11-11 那次事故把 10 GB 的包推上云，14 天里一直躺着。
+        这里按大小兜底，先删"完整快照"（它们体积最大且价值最低），轻量快照尽量留。
+        """
+        try:
+            _raw_cap = getattr(self.config, 'cloud_max_total_gb', 8.0)
+            cap_gb = 8.0 if (_raw_cap is None or _raw_cap == '') else float(_raw_cap)
+        except (TypeError, ValueError):
+            cap_gb = 8.0
+        if cap_gb <= 0:
+            return 0
+        try:
+            files = [f for f in sync_dir.glob('snapshot_*') if f.is_file()]
+            total = sum(f.stat().st_size for f in files) / (1024 ** 3)
+            if total <= cap_gb:
+                ZeroFallLogger.info("[云端体量] {:.2f} GB / 上限 {:.1f} GB，无需清理".format(total, cap_gb))
+                return 0
+            # 体积大的先删（完整快照），同体积按时间旧优先
+            files.sort(key=lambda f: (-f.stat().st_size, f.name))
+            removed = 0
+            for f in files:
+                if total <= cap_gb:
+                    break
+                if f.name.endswith('.meta.json'):
+                    continue
+                sz = f.stat().st_size / (1024 ** 3)
+                try:
+                    self._unlink_cloud_with_meta(f)
+                    total -= sz
+                    removed += 1
+                except Exception as e:
+                    ZeroFallLogger.warning("[云端体量] 删除 {} 失败: {}".format(f.name, e))
+            if removed:
+                ZeroFallLogger.warning(
+                    "[云端体量] 超限（上限 {:.1f} GB）→ 已删 {} 个，当前 {:.2f} GB".format(
+                        cap_gb, removed, total))
+            return removed
+        except Exception as e:
+            ZeroFallLogger.warning("[云端体量] 清理异常: {}".format(e))
+            return 0
 
     def _update_status(self):
         """更新状态显示"""
@@ -2201,12 +2312,20 @@ class ZeroFallMainWindow(QMainWindow):
         try:
             if self.guardian.is_deepseek_running():
                 ZeroFallLogger.info("[自动] DeepSeek 已在运行，跳过自动启动")
+                try:
+                    from modules import fault_timeline as _ftl2
+                    from modules import __version__ as _ver
+                    _ftl2.record("zf_start", "ZeroFall 启动 v{}".format(_ver))
+                except Exception:
+                    pass
+                self._record_timeline_boot_ok("启动自检时 DSH 已在运行")
                 return
             
             ZeroFallLogger.info("[自动] 正在启动 DeepSeek ...")
             success, msg = self.guardian.launch_deepseek(bypass_check=True)
             
             if success:
+                self._record_timeline_boot_ok("ZeroFall 启动 DSH 成功")
                 self._auto_launched = True
                 self._launch_ts = time.time()
                 ZeroFallLogger.info("[自动] DeepSeek 启动成功，进入守护模式")
@@ -2423,7 +2542,7 @@ class ZeroFallMainWindow(QMainWindow):
     def _cfg_int(self, field: str, default: int) -> int:
         """读整数配置，容忍 None/非法值，但**保留合法的 0**
 
-        为什么要这个函数：`int(getattr(cfg, 'x', 20) or 20)` 这种写法在
+        为什么要这个函数：`config_int(cfg, 'x', 20)` 这种写法在
         "0 是有意义的值"时会静默把 0 变成 20 —— 项目里已经因此出过一次
         bug（plugin_drift_settle_seconds 设 0 不生效）。
         统一用这里读，就不会再踩。
@@ -2567,7 +2686,7 @@ class ZeroFallMainWindow(QMainWindow):
                 else:
                     ZeroFallLogger.info("[子控] 传输: 共享目录（未配置主控地址）")
             
-            interval = max(15, int(getattr(self.config, 'control_poll_seconds', 60) or 60)) * 1000
+            interval = max(15, config_int(self.config, 'control_poll_seconds', 60)) * 1000
             self._control_timer = QTimer(self)
             self._control_timer.timeout.connect(self._control_tick)
             self._control_timer.start(interval)
@@ -2576,6 +2695,19 @@ class ZeroFallMainWindow(QMainWindow):
         except Exception as e:
             ZeroFallLogger.warning("[主控/子控] 初始化失败: {}".format(e))
     
+    def _record_timeline_boot_ok(self, reason: str = ""):
+        """DSH 起来之后记一条基线：以后崩了就看"自这次成功以来变了什么" """
+        try:
+            from modules import fault_timeline as _ftl
+            fp = _ftl.fingerprint([
+                getattr(self.config, "deepseek_plugins_dir", "") or "",
+                str(Path(getattr(self.config, "deepseek_plugins_dir", "") or "") / "profiles" / "desktop"),
+            ])
+            _ftl.mark_boot_ok(fp, reason)
+            ZeroFallLogger.info("[时间线] 已记录启动基线（指纹 {}）{}".format(fp, (" · " + reason) if reason else ""))
+        except Exception as e:
+            ZeroFallLogger.debug("[时间线] 记录基线失败: {}".format(e))
+
     def _start_master_http_server(self):
         """启动主控内建更新服务器（子控可 HTTP 直连，不依赖网盘同步延迟）"""
         self._http_server = None
@@ -2588,10 +2720,25 @@ class ZeroFallMainWindow(QMainWindow):
             if not root:
                 ZeroFallLogger.warning("[主控] HTTP 服务器未启动: 通道目录未知")
                 return
+            token = str(getattr(self.config, 'http_token', '') or '').strip()
+            if not token:
+                # 空 token = 裸奔（本机任何进程都能触发备份/回滚/重启）。
+                # 这里自动生成一个并落盘，子控那边照抄即可。
+                import secrets as _secrets
+                token = _secrets.token_urlsafe(24)
+                self.config.http_token = token
+                try:
+                    self.config_manager.save()
+                    ZeroFallLogger.info(
+                        "[主控] http_token 为空 → 已自动生成并写入配置：{}…".format(token[:8]))
+                except Exception as _se:
+                    ZeroFallLogger.warning("[主控] 自动生成的 token 保存失败: {}".format(_se))
+            bind = str(getattr(self.config, 'http_bind', '127.0.0.1') or '127.0.0.1')
             srv = MasterHttpServer(
                 str(root),
-                port=int(getattr(self.config, 'http_port', 8765) or 8765),
-                token=str(getattr(self.config, 'http_token', '') or ''),
+                port=config_int(self.config, 'http_port', 8765),
+                token=token,
+                bind=bind,
             )
             ok = srv.start()
             if ok:
@@ -2981,6 +3128,11 @@ class ZeroFallMainWindow(QMainWindow):
             ZeroFallLogger.error(traceback.format_exc())
     
     def _on_deepseek_exit(self, exit_code: int):
+        try:
+            from modules import fault_timeline as _ftl
+            _ftl.record("dsh_exit", "DeepSeek 退出（exit={}）".format(exit_code))
+        except Exception:
+            pass
         """DeepSeek退出回调 - 共生退出"""
         # 崩溃自愈路径里主动 kill 了 DeepSeek，这次退出不算用户正常关闭，不能跟着退
         if getattr(self, '_suppress_follow_exit', False):

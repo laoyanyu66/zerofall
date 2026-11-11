@@ -75,3 +75,18 @@ dist_release/
 check_open_source.py
 make_source_zip.py
 upload_to_github.py
+
+# 云端迁移/加密的中间文件（可能含明文快照，绝不能进仓库）
+*.zf-plain
+*.zf-new
+*.zf-verify
+*.zf-tmp
+*.zf-conflict
+# 版本点与时间线（本机数据）
+.zf-config-history/
+timeline.jsonl
+upgrade_cache.json
+secret_vault.zfv
+# 本机自检报告/个人笔记
+自检报告_*.md
+测试*.md

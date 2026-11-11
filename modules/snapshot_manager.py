@@ -16,6 +16,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from config import ZeroFallConfig
 from logger import ZeroFallLogger
 from utils import (
+    config_int,
     calculate_md5, calculate_directory_md5, get_directory_size,
     copy_directory, create_archive, extract_archive, compare_directories,
     generate_snapshot_id, format_timestamp
@@ -146,6 +147,65 @@ def copy_for_snapshot(src: Path, dst: Path, include_runtime: bool = False) -> di
                 stats["skipped_files"] += 1
 
     return stats
+
+def _int_opt(value, default):
+    """把配置值转 int，坏值才退回默认。
+
+    刻意不用 `value or default`：那会把合法的 0 吞掉（本项目已出过
+    plugin_drift_settle_seconds=0 被 `0 or 20` 变成 20 的事故），
+    selfcheck 的 [1] 号检查专门盯这个写法。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def plan_retention(snapshots, max_light, max_full,
+                   protected_ids=None, keep_newest_full=True, keep_newest_light=True):
+    """按本地保留上限算出应删除的健康快照 ID（最老优先）。
+
+    为什么需要这条硬上限：``get_overflow_snapshots()`` 的消费者是
+    ``ui/main_window.py::_handle_overflow_to_cloud``（溢出 → 云归档 → 删本地）。
+    它对同一份快照连续失败 3 次就停止重试**并保留本地** —— 归档一旦长期不可用，
+    这批快照就永久占盘。2026-11-11 的实测后果：190 GB 的盘被 30 份快照（83 GB）
+    + 3 个 zip（20.6 GB）填到 0 字节可用，之后的快照写入只剩 530 字节残包。
+    所以本地还需要一条不依赖云端的硬上限。
+
+    保护规则（宁可多留，不可误删）：
+      · 最新一份完整快照 —— 撤销/恢复至少要有一个可用的基线
+      · 最新一份轻量快照 —— 崩溃自愈叠加链的末端
+      · protected_ids    —— 调用方显式点名的（崩溃恢复目标、正在恢复的链）
+
+    max_* <= 0 表示该类不设上限（0 不解释成"全部删掉"）。
+    """
+    protected = set(protected_ids or ())
+    max_light = _int_opt(max_light, 0)
+    max_full = _int_opt(max_full, 0)
+    healthy = [s for s in snapshots.values() if s.status == SnapshotStatus.HEALTHY]
+    groups = (
+        (sorted([s for s in healthy if not getattr(s, 'is_full', False)],
+                key=lambda s: s.created_at), max_light, keep_newest_light),
+        (sorted([s for s in healthy if getattr(s, 'is_full', False)],
+                key=lambda s: s.created_at), max_full, keep_newest_full),
+    )
+    doomed = []
+    for group, limit, keep_newest in groups:
+        if limit <= 0 or len(group) <= limit:
+            continue
+        remaining = len(group)
+        for snap in group:                      # 最老优先
+            if remaining <= limit:
+                break
+            sid = snap.snapshot_id
+            if sid in protected:
+                continue
+            if keep_newest and snap is group[-1]:
+                continue
+            doomed.append(sid)
+            remaining -= 1
+    return doomed
+
 
 class SnapshotStatus(Enum):
     """快照状态枚举"""
@@ -637,13 +697,13 @@ class SnapshotManager:
             except Exception as e:
                 ZeroFallLogger.warning("认证态备份失败（不影响主快照）: {}".format(e))
             
-            # 备份会话数据
-            if self.config.backup_session_data:
-                session_src = Path(self.config.deepseek_session_dir)
-                if session_src.exists():
+            # 备份会话数据（轻量快照默认不带：见 config.sessions_only_in_full）
+            if self._should_include_sessions(include_runtime):
+                session_src = self._resolve_session_dir()
+                if session_src is not None:
                     session_dst = snapshot_path / "sessions"
                     copy_directory(str(session_src), str(session_dst))
-                    ZeroFallLogger.debug("会话数据备份完成")
+                    ZeroFallLogger.debug("会话数据备份完成: {}".format(session_src))
             
             # 收集插件信息
             plugins = self._collect_plugin_info()
@@ -651,6 +711,13 @@ class SnapshotManager:
             # 计算快照大小
             size_mb = get_directory_size(str(snapshot_path))
             
+            # 记下源机器路径：恢复时用来改写旧前缀（换机/改用户名）
+            try:
+                from modules import path_rewrite as _pr
+                _pr.write_meta(snapshot_path, self.config)
+            except Exception as _e:
+                ZeroFallLogger.debug("写快照路径 meta 失败: {}".format(_e))
+
             # 创建压缩包
             archive_path = str(snapshot_path) + ".zip"
             create_archive(str(snapshot_path), archive_path)
@@ -671,7 +738,7 @@ class SnapshotManager:
                 md5_checksum=md5_checksum,
                 plugins=plugins,
                 notes=notes,
-                has_session_data=self.config.backup_session_data,
+                has_session_data=self._should_include_sessions(include_runtime),
                 has_keys=self.config.backup_keys,
                 archive_path=archive_path,
                 is_full=include_runtime
@@ -682,6 +749,7 @@ class SnapshotManager:
             self._save_index()
             
             ZeroFallLogger.snapshot_created(snapshot_id, size_mb, len(plugins))
+            self._write_restore_script(archive_path, snapshot_id)
             
             # 自动清理老旧快照
             self._cleanup_old_snapshots()
@@ -766,6 +834,19 @@ class SnapshotManager:
             ZeroFallLogger.error("干净恢复异常: {}".format(e))
         return removed
     
+    def _should_include_sessions(self, include_runtime: bool) -> bool:
+        """会话是否纳入本次快照
+
+        sessions_only_in_full=True（默认）：只有完整快照带会话 ——
+        轻量快照每 10 分钟一份，塞 30 MB 会话会让每份从 24 MB 涨到 54 MB，
+        48 份就差出 1.3 GB，而 10 分钟粒度的恢复点根本不需要会话。
+        """
+        if not bool(getattr(self.config, "backup_session_data", False)):
+            return False
+        if bool(getattr(self.config, "sessions_only_in_full", True)):
+            return bool(include_runtime)
+        return True
+
     def restore_snapshot(self, snapshot_id: str, mode: RestoreMode,
                           overlay: bool = False,
                           skip_pre_restore_backup: bool = False) -> bool:
@@ -892,6 +973,18 @@ class SnapshotManager:
                         copy_directory(str(session_src), str(session_dst))
                         ZeroFallLogger.debug("会话数据已覆盖恢复")
             
+            # 恢复后改写旧机器路径（换机 / 改用户名时不做这步，配置里全是死路径）
+            try:
+                from modules import path_rewrite as _pr
+                _rw = _pr.rewrite_after_restore(temp_dir, self.config)
+                if _rw.get("files_changed"):
+                    ZeroFallLogger.info(
+                        "[恢复] 路径改写完成：{}/{} 处，涉及 {} 个文件（已留 .bak-zf-rewrite-*）".format(
+                            _rw.get("replacements"), _rw.get("files_scanned"),
+                            _rw.get("files_changed")))
+            except Exception as _e:
+                ZeroFallLogger.warning("[恢复] 路径改写跳过: {}".format(_e))
+
             # 恢复后自动重建 profile 依赖（node_modules 已被排除，需 pnpm install 秒级重建）
             if mode in (RestoreMode.PLUGIN_ONLY, RestoreMode.FULL_RESTORE):
                 self._ensure_profile_deps()
@@ -991,6 +1084,112 @@ class SnapshotManager:
             ZeroFallLogger.error(f"删除快照失败: {e}")
             return False
     
+    def _resolve_session_dir(self) -> Optional[Path]:
+        """解析要备份的会话目录；不可用时返回 None（宁可不备份，也不能乱备份）。
+
+        2026-11-11 的事故：``deepseek_session_dir`` 为空时 ``Path('')`` 落到进程
+        当前工作目录。ZeroFall 由开机自启拉起时 cwd 是 ``C:\\Windows\\System32``，
+        于是"会话数据"把整个 System32 打了进去 —— 单份快照 13,985 MB
+        （msedge.dll 316 MB、MRT.exe 220 MB、DriverStore、lxss…），
+        30 分钟一份，把 190 GB 的盘写到 0 可用。
+
+        现在的门槛：空配置直接跳过；落到系统目录/盘根/当前工作目录/不存在的路径
+        一律跳过；体积超过 session_backup_max_mb（默认 512 MB）也跳过。
+        """
+        raw = getattr(self.config, 'deepseek_session_dir', '') or ''
+        raw = str(raw).strip()      # 容忍 config 里被写成 Path / 数字 之类
+        if not raw:
+            # 空配置 → 回落到 <DSH_HOME>/sessions（而不是当前工作目录！）
+            home = str(getattr(self.config, 'deepseek_plugins_dir', '') or '').strip()
+            cand = Path(home) / "sessions" if home else None
+            if cand is not None and cand.is_dir():
+                ZeroFallLogger.info(
+                    "deepseek_session_dir 为空，自动使用 DSH_HOME/sessions：{}".format(cand))
+                raw = str(cand)
+            else:
+                ZeroFallLogger.warning(
+                    "backup_session_data 已开启但 deepseek_session_dir 为空：跳过会话备份"
+                    "（不再退化成当前工作目录）")
+                return None
+
+        try:
+            src = Path(raw).expanduser()
+            if not src.is_absolute():
+                src = (Path.cwd() / src)
+            src = src.resolve()
+        except Exception as e:
+            ZeroFallLogger.warning("会话目录无法解析，跳过快照内会话备份: {}".format(e))
+            return None
+
+        if not src.is_dir():
+            ZeroFallLogger.warning("会话目录不存在，跳过会话备份: {}".format(src))
+            return None
+
+        # 闸门分两类，语义不同，不能混用：
+        #   subtree —— 系统树（Windows/Program Files）：路径只要落在里面就危险
+        #   exact   —— 盘根 / 用户主目录 / 进程 cwd：只在"正好指向它"时危险，
+        #              否则 %TEMP% 这种在 home 下面的正常路径也会被误杀
+        subtree, exact = [], []
+        for var in ('SystemRoot', 'windir', 'ProgramFiles', 'ProgramFiles(x86)'):
+            v = os.environ.get(var)
+            if not v:
+                continue
+            try:
+                root = Path(v).resolve()
+            except Exception:
+                continue
+            subtree.append(root)
+            subtree.append(root / 'System32')
+        drive = os.environ.get('SystemDrive')
+        if drive:
+            try:
+                exact.append(Path(drive + '\\').resolve())
+            except Exception:
+                pass
+        try:
+            exact.append(Path.home().resolve())
+            exact.append(Path.cwd().resolve())
+        except Exception:
+            pass
+        if src.parent == src:                       # 任何盘根，如 D:\
+            exact.append(src)
+
+        blocked = None
+        for d in exact:
+            try:
+                if src == d:
+                    blocked = d
+                    break
+            except Exception:
+                continue
+        if blocked is None:
+            for d in subtree:
+                try:
+                    if src == d or d in src.parents:
+                        blocked = d
+                        break
+                except Exception:
+                    continue
+        if blocked is not None:
+            ZeroFallLogger.warning(
+                "会话目录指向系统/工作目录（{}），已跳过会话备份".format(src))
+            return None
+
+        # 体量闸：会话数据本该是 MB 级，超过上限说明配置又指错了
+        # 注意 get_directory_size() 返回的就是 MB（utils 的既有约定），别再除一次
+        cap_mb = _int_opt(getattr(self.config, 'session_backup_max_mb', 512), 512)
+        try:
+            size_mb = float(get_directory_size(str(src)))
+        except Exception:
+            size_mb = 0.0
+        if cap_mb > 0 and size_mb > cap_mb:
+            ZeroFallLogger.warning(
+                "会话目录 {} 有 {:.0f} MB，超过上限 {} MB，跳过会话备份"
+                "（检查 deepseek_session_dir 是否指错）".format(src, size_mb, cap_mb))
+            return None
+
+        return src
+
     def _cleanup_old_snapshots(self):
         """清理老旧快照
         
@@ -1030,6 +1229,67 @@ class SnapshotManager:
                 old_id, _ = crashed.pop(0)
                 self.delete_snapshot(old_id)
                 ZeroFallLogger.info("清理多余崩溃快照: {}".format(old_id))
+
+            # 健康快照的本地硬上限（两档）。
+            # 正常路径仍是「溢出 → 云归档 → 删本地」（ui/main_window.py 的
+            # _handle_overflow_to_cloud，按 get_overflow_snapshots() 消费）；
+            # 但归档连续失败 3 次后那边只是"停止重试并保留本地"，于是一批永远不会
+            # 被归档的快照永久占盘 —— 2026-11-11 实测 30 份 83 GB，把 190 GB 的 D:
+            # 写到 0 字节可用。这里补一条兜底：
+            #   宽松档：只压到上限的 2 倍，中间那段留给云归档；
+            #   紧急档：可用空间 < 4 GB 时直接压到上限。
+            max_light = _int_opt(getattr(self.config, 'max_light_snapshots', 0), 0)
+            max_full = _int_opt(getattr(self.config, 'max_full_snapshots', 0), 0)
+            protected = set(getattr(self, 'retention_protected_ids', None) or ())
+
+            try:
+                free_gb = shutil.disk_usage(str(self.config.snapshot_dir)).free / (1024 ** 3)
+            except Exception:
+                free_gb = -1.0
+
+            window_light = max_light * 2 if max_light > 0 else 0
+            window_full = max_full * 2 if max_full > 0 else 0
+            emergency = bool(getattr(self, 'retention_emergency', False))
+            if emergency or (0 <= free_gb < 4.0):
+                window_light, window_full = max_light, max_full
+                ZeroFallLogger.warning(
+                    "本地快照直接压到保留上限（可用 {:.2f} GB，上限 轻量 {} / 完整 {}）".format(
+                        free_gb, max_light, max_full))
+
+            doomed = plan_retention(self.snapshots, window_light, window_full,
+                                    protected_ids=protected)
+            for sid in doomed:
+                if self.delete_snapshot(sid):
+                    ZeroFallLogger.info(
+                        "按保留上限清理快照: {}（max_light={} / max_full={}）".format(
+                            sid, max_light, max_full))
+
+            # 兜底：可用空间跌破 2 GB 时，从最老的完整快照开始腾地方，
+            # 否则下一次快照会以 EBUSY/ENOSPC 收场，只留下几百字节的残包。
+            try:
+                free_gb = shutil.disk_usage(str(self.config.snapshot_dir)).free / (1024 ** 3)
+            except Exception:
+                free_gb = -1.0
+            if 0 <= free_gb < 2.0:
+                fulls = sorted(
+                    [s for s in self.snapshots.values()
+                     if s.status == SnapshotStatus.HEALTHY and getattr(s, 'is_full', False)],
+                    key=lambda s: s.created_at)
+                newest = fulls[-1].snapshot_id if fulls else None
+                for snap in fulls:
+                    if free_gb >= 2.0:
+                        break
+                    if snap.snapshot_id in protected or snap.snapshot_id == newest:
+                        continue
+                    if self.delete_snapshot(snap.snapshot_id):
+                        ZeroFallLogger.warning(
+                            "磁盘可用仅 {:.2f} GB，清理最老完整快照: {}".format(
+                                free_gb, snap.snapshot_id))
+                        try:
+                            free_gb = shutil.disk_usage(
+                                str(self.config.snapshot_dir)).free / (1024 ** 3)
+                        except Exception:
+                            break
         except Exception as e:
             ZeroFallLogger.error(f"清理快照失败: {e}")
     
@@ -1106,8 +1366,8 @@ class SnapshotManager:
             'full_count': len(fulls), 'full_mb': full_mb, 'full_cover_h': cover_f,
             'total_mb': light_mb + full_mb, 'extra_mb': extra,
             'free_gb': free_gb,
-            'light_max': int(getattr(self.config, 'max_light_snapshots', 48) or 0),
-            'full_max': int(getattr(self.config, 'max_full_snapshots', 12) or 0),
+            'light_max': config_int(self.config, 'max_light_snapshots', 48),
+            'full_max': config_int(self.config, 'max_full_snapshots', 12),
         }
 
     def get_restorable_ids(self) -> set:
@@ -1366,3 +1626,61 @@ class SnapshotManager:
         except Exception as e:
             ZeroFallLogger.error(f"导入快照失败: {e}")
             return None
+
+    def _write_restore_script(self, archive_path: str, snapshot_id: str) -> None:
+        """在快照旁边放一个脱离 ZeroFall 也能跑的恢复脚本
+
+        为什么：插件生态里的 dsh-backup-rescue 给每份备份挂同名 .bat，
+        换到一台没装本工具的机器也能还原。ZeroFall 的 exe 自己能恢复，
+        但"exe 不在/打不开"时就没招了 —— 这个 .cmd 只依赖 Windows 自带组件。
+        """
+        try:
+            arc = Path(archive_path)
+            cmd = arc.with_name("恢复_{}.cmd".format(arc.stem))
+            target = str(getattr(self.config, "deepseek_plugins_dir", "") or "").strip()
+            script = (
+                "@echo off\r\n"
+                "chcp 65001 >nul\r\n"
+                "rem ZeroFall 快照独立恢复脚本 —— 只需 Windows 自带 PowerShell/Expand-Archive\r\n"
+                "set \"ZIP=%~dp0{zip}\"\r\n"
+                "set \"TARGET={target}\"\r\n"
+                "if not exist \"%ZIP%\" ( echo 找不到压缩包: %ZIP% & pause & exit /b 1 )\r\n"
+                "if \"%TARGET%\"==\"\" set \"TARGET=%USERPROFILE%\\.dsh\"\r\n"
+                "echo 即将从快照恢复到: %TARGET%\r\n"
+                "echo. 先把现有目录复制一份到 %TARGET%.bak-<时间戳>\r\n"
+                "powershell -NoProfile -Command \"$t='%TARGET%'; if (Test-Path $t) {{ Copy-Item $t ($t + '.bak-' + (Get-Date -Format yyyyMMdd-HHmmss)) -Recurse -Force }}\"\r\n"
+                "echo. 解压快照...\r\n"
+                "powershell -NoProfile -Command \"Expand-Archive -LiteralPath '%ZIP%' -DestinationPath $env:TEMP\\zf-restore -Force\"\r\n"
+                "echo. 覆盖复制（plugins / config / sessions）\r\n"
+                "powershell -NoProfile -Command \"$src=Join-Path $env:TEMP 'zf-restore'; foreach($d in 'plugins','config','sessions'){{ $s=Join-Path $src $d; if (Test-Path $s) {{ if($d -eq 'plugins'){{ $dst='%TARGET%' }} else {{ $dst=Join-Path '%TARGET%' $d }}; New-Item -ItemType Directory -Force -Path $dst | Out-Null; Copy-Item (Join-Path $s '*') $dst -Recurse -Force }} }}\"\r\n"
+                "echo 恢复完成。请重启 DeepSeek Harness。\r\n"
+                "pause\r\n"
+            ).format(zip=arc.name, target=target)
+            cmd.write_text(script, encoding="utf-8", errors="replace")
+            ZeroFallLogger.debug("恢复脚本已生成: {}".format(cmd.name))
+        except Exception as e:
+            ZeroFallLogger.debug("恢复脚本生成失败（不影响快照）: {}".format(e))
+
+    def write_restore_scripts(self) -> Dict[str, int]:
+        """给所有已有快照补一份独立恢复脚本（.cmd）
+
+        恢复脚本是后加的能力，之前的快照旁边没有 —— 换台没装 ZeroFall 的机器时，
+        那些老快照就成了"只能靠本程序打开"的死数据。这里一次性补齐。
+        """
+        stats = {"written": 0, "skipped": 0, "missing": 0}
+        for snap in list(self.snapshots.values()):
+            arc = Path(getattr(snap, "archive_path", "") or "")
+            if not arc.is_file():
+                stats["missing"] += 1
+                continue
+            cmd = arc.with_name("恢复_{}.cmd".format(arc.stem))
+            if cmd.is_file():
+                stats["skipped"] += 1
+                continue
+            self._write_restore_script(str(arc), snap.snapshot_id)
+            if cmd.is_file():
+                stats["written"] += 1
+        if stats["written"]:
+            ZeroFallLogger.info("[恢复脚本] 已为 {} 个既有快照补齐（跳过 {} 个已存在）".format(
+                stats["written"], stats["skipped"]))
+        return stats

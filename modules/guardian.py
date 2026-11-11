@@ -85,7 +85,11 @@ class Guardian:
                     return False, f"DeepSeek可执行文件不存在: {exe_path}"
                 
                 # 启动进程
-                self.deepseek_process = subprocess.Popen([exe_path])
+                from utils import sanitized_child_env
+                # 不把 PyInstaller onefile 的簿记变量漏给 DSH，
+                # 否则从 DSH 那条链再启动 ZeroFall 会撞父进程校验失败。
+                self.deepseek_process = subprocess.Popen(
+                    [exe_path], env=sanitized_child_env())
                 self._invalidate_running_cache()
 
                 ZeroFallLogger.deepseek_launched()

@@ -17,6 +17,7 @@
   · 不打包任何插件源码、会话文件、快照压缩包本体
   · 不打包明文凭据 —— 脱敏是硬约束，测试里有专门断言
 """
+from utils import config_int
 import json
 import os
 import platform
@@ -171,7 +172,7 @@ def _snapshots_dump(config) -> dict:
                 'id': getattr(s, 'snapshot_id', ''),
                 'created_at': getattr(s, 'created_at', ''),
                 'is_full': bool(getattr(s, 'is_full', False)),
-                'size_mb': round(float(getattr(s, 'size_mb', 0) or 0), 2),
+                'size_mb': round(float(getattr(s, 'size_mb', 0) or 0), 2),  # noqa: or-num（0 与 None 同义，这里确实一样）
                 'healthy': bool(getattr(s, 'is_healthy', True)),
                 'notes': str(getattr(s, 'notes', ''))[:80],
             })
@@ -233,3 +234,47 @@ def build_diagnostic_bundle(config, dest_path=None, log_dir=None,
             '发送前建议自己解压看一眼，确认没有不想外传的路径信息。\n'
         ))
     return dest
+
+
+def retention_reconcile(config, snapshot_dir=None) -> dict:
+    """配置里的保留策略 vs 盘上实况（防"配置改了没人知道"的漂移）
+
+    2026-11-11 自检发现：配置写 max_light=48/max_full=12，实际盘上 20 份、
+    1.68 GB，跟上一轮记录的 12/4 完全不是一回事，中间没人核对过。
+    """
+    try:
+        from pathlib import Path as _P
+        root = _P(snapshot_dir or getattr(config, "snapshot_dir", "") or "")
+        files = sorted(root.glob("snapshot_*.zip")) if root.is_dir() else []
+        size_gb = round(sum(f.stat().st_size for f in files) / (1024 ** 3), 2) if files else 0.0
+        # 轻量/完整按大小粗分：完整快照含运行时，明显更大
+        sizes = [f.stat().st_size for f in files]
+        median = sorted(sizes)[len(sizes) // 2] if sizes else 0
+        full = [f for f in files if median and f.stat().st_size >= median * 2]
+        light = [f for f in files if f not in full]
+        cfg = {
+            "max_light": config_int(config, 'max_light_snapshots', 0),
+            "max_full": config_int(config, 'max_full_snapshots', 0),
+            "silent_minutes": config_int(config, 'silent_snapshot_interval_minutes', 0),
+            "full_minutes": config_int(config, 'full_snapshot_interval_minutes', 0),
+        }
+        notes = []
+        if cfg["max_light"] and len(light) >= cfg["max_light"]:
+            notes.append("轻量快照已达上限 {}/{}".format(len(light), cfg["max_light"]))
+        if cfg["max_full"] and len(full) > cfg["max_full"]:
+            notes.append("完整快照超出配置 {}/{}".format(len(full), cfg["max_full"]))
+        projected_gb = 0.0
+        if light or full:
+            avg_l = sum(f.stat().st_size for f in light) / len(light) if light else 0
+            avg_f = sum(f.stat().st_size for f in full) / len(full) if full else 0
+            projected_gb = round((avg_l * cfg["max_light"] + avg_f * cfg["max_full"]) / (1024 ** 3), 2)
+        return {
+            "dir": str(root),
+            "config": cfg,
+            "disk": {"total": len(files), "light": len(light), "full": len(full),
+                     "size_gb": size_gb},
+            "steady_state_gb": projected_gb,
+            "notes": notes,
+        }
+    except Exception as e:
+        return {"error": str(e)}

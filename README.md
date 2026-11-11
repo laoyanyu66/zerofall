@@ -30,6 +30,14 @@ DeepSeek Harness 的环境由一堆插件、配置、运行时组成。这套东
 | **环境校验** | 6 项检查：可执行文件、插件目录、MD5 一致性、未备份改动、上次退出状态、会话完整性 |
 | **云备份**（可选） | 把最新健康快照加密后写入**你自己指定**的同步盘目录 |
 | **诊断包导出** | 一键打包日志和配置（密钥已脱敏），用于提 Issue |
+| **配置中心**（7 页签） | profile 补丁按 entry 改 config 块 / 提示词注入稿 / Agent 预设 / 备份与回滚 / 迁移与历史 / profile 健康 / 会话修复 |
+| **迁移包** | 导出成 ZIP（默认剥离密钥、可设密码走 scrypt + AES-256-GCM），导入前逐项预览 diff、三种冲突策略、路径映射；支持三方合并 |
+| **版本点与 tag** | 存点 / 列表 / 看差异 / 任意两点互 diff / 打 tag（带 tag 的点不会被索引截断挤掉） |
+| **profile 健康诊断**（10 项） | manifest 可读性、bundle 可解析性、bundles↔dependencies、重置形状、lockfile、`file:` 联接、patch 悬空 insert、workspace 引用、storages 死路径、凭据完整度；一条 `can_restart` 判据 |
+| **会话文件修复** | `session.v4.jsonl.zstd` 逐帧解析：拆单帧布局、按 seq 去重；修前必备份、修后三重校验；非 v4 只报不改 |
+| **云端容器 ZFCH1** | 分块 AES-256-GCM（开销 ≈ 1.0，老的 Fernet 是 1.33），兼容老文件；带体量上限与格式迁移 |
+| **故障时间线** | 每次启动成功记基线指纹，崩溃/退出/变更逐条记，看"自上次成功以来变了什么" |
+| **升级预览** | 查 npm 最新版本，列出本地插件里会掉队/本地源/内建的三类 |
 
 ---
 
@@ -147,13 +155,24 @@ ZeroFall/
 │   ├── environment_checker.py  环境校验
 │   ├── crash_classifier.py     崩溃日志分类
 │   ├── diagnostics.py          诊断包导出
-│   ├── secret_store.py         密钥自持
+│   ├── secret_store.py         密钥自持（源码模式也认 exe 同级那份）
 │   ├── acp_client.py           ACP 会话（主控自动修复用）
 │   ├── master.py / control.py  主控 / 子控
+│   ├── dsh_config.py           配置行级编辑（保留注释/!!js 标签）
+│   ├── config_bundle.py        迁移包 / 版本点 / tag / 两点互 diff
+│   ├── config_crypto.py        scrypt + AES-256-GCM 容器
+│   ├── profile_health.py       profile 健康诊断 10 项 + 按建议修正
+│   ├── session_repair.py       会话文件扫描/修复（依赖 tools/session_zstd.cjs）
+│   ├── path_rewrite.py         恢复后旧路径改写
+│   ├── secret_vault.py         本机密钥库（迁移包占位符回填）
+│   ├── fault_timeline.py       故障时间线
+│   ├── upgrade_preview.py      升级预览（npm 版本对比）
+│   ├── cloud_crypto.py / cloud_migrate.py  云端加密容器与格式迁移
+│   ├── housekeeping.py         备份残渣清理
 │   └── ...
 ├── ui/                  界面（theme.py 是设计令牌，dialogs.py 是统一弹窗）
 ├── tools/               开发期辅助脚本，不参与运行时
-├── tests/               测试（37 个，python tests/test_xxx.py 直接跑）
+├── tests/               测试（15 个文件 / 388 项断言，python tests/test_xxx.py 直接跑）
 ├── docs/
 │   ├── PACKAGING.md     打包说明
 │   └── archive/         历史版本文档

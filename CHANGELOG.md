@@ -9,6 +9,88 @@
 
 ---
 
+## [1.6.0] - 2026-11-11
+
+这一天基本都在补"事故之后才会想到"的能力：把隔壁 DSH 生态里几套工具的核心思路
+（配置打包迁移、profile 健康诊断、会话文件修复、插件护栏）吃进 ZeroFall 的配置中心，
+同时修掉三个会静默丢数据的坑。
+
+### 新增
+
+- **配置中心（7 页签）**：profile 补丁编辑（按 entry 只改 config 块，保留注释与 `!!js` 标签）、
+  提示词注入稿、Agent 预设、备份与回滚、迁移与历史、profile 健康、会话修复
+- **迁移包**：导出 ZIP（默认剥离密钥，可设密码走 scrypt + AES-256-GCM）、导入前逐项预览 diff、
+  三种冲突策略 + 三方合并 `merge3`、路径映射
+- **版本点与 tag**：`save_point` / `list_points` / `diff_point` / 任意两点 `diff_points` /
+  `tag_point`；带 tag 的点不会被索引截断挤掉
+- **profile 健康诊断 10 项** + `can_restart` 判据 + 「按建议修正」（摘除不可解析 bundle）
+- **会话文件扫描/修复**：`session.v4.jsonl.zstd` 逐帧解析（RFC 8878 帧边界，Node 自带
+  zstd 只解第一帧），拆单帧布局、按 seq 去重；修前备份、修后三重校验；非 v4 只报不改
+- **云端容器 ZFCH1**：分块 AES-256-GCM（开销 ≈1.0，老 Fernet 是 1.33），兼容老 `.enc`；
+  新增体量上限 `cloud_max_total_gb` 与格式迁移 `cloud_migrate`
+- **本机密钥库 + 占位符回填**：迁移包里密钥写成 `__ZF_SECRET__:<槽位>`，同机导入自动回填
+- **恢复后路径改写**：快照写入 `_zf_meta.json`，恢复时把旧 `$DSH_HOME`/用户目录前缀换成新值
+- **故障时间线、升级预览、残渣清理**：分别解决"崩了不知道为什么"、"升级会掉哪些插件"、
+  "`.bak` 只增不减"
+- **每份快照挂独立恢复脚本** `恢复_*.cmd`（不装本程序也能还原）
+
+### 修复
+
+- **会话不进备份**：`deepseek_session_dir` 为空时不再退化成当前工作目录，而是回落
+  `$DSH_HOME/sessions`；会话默认进完整快照、不进 10 分钟粒度的轻量快照（省 1.3 GB）
+- **密钥库分裂**：源码模式与打包版各读一份 `secrets.json`，导致同一批云端快照出现
+  两把钥匙；`base_dir()` 改为源码模式优先用 exe 同级那份，并把孤儿密码加密的包重新归队
+- **云端失控**：只按天数保留会让一次事故的 10 GB 包躺满两周，补体量上限；
+  云端加密改二进制容器，省 25%
+- **迁移临时文件清理失败被静默吞掉**：同步盘占用时明文快照会留在会同步到云的目录里，
+  现在上报 `LEFTOVERS` 并提供 `cleanup_leftovers()`
+
+### 变更
+
+- `max_light_snapshots` 保持 48 不变；改为「会话只进完整快照」来控体积
+- README 与仓库结构同步更新；两处测试文件改名以避开"敏感文件名"误报
+
+---
+
+## [1.5.3] - 2026-11-11
+
+接着 1.5.2 往下查生产日志，两条都是"没人报案、但一直在流血"的问题。
+
+### 修复
+
+- **一个 Unity/OneDrive 级别的 junction 就能把整次快照打死**
+  本机实测（`D:\zerofall\logs\zerofall_20261111.log`）：
+  ```
+  08:50:42 ERROR 创建快照失败: [WinError 5] 拒绝访问。:
+     'D:\dsh备份\snapshot_20261111_084102\sessions\%userprofile%\OneDrive'
+  08:50:42 WARNING [每日完整快照] 创建失败
+  ```
+  DSH 会话目录里那个字面量 `%userprofile%` 目录，里面的 `OneDrive` 是重解析点
+  （junction），读它直接被拒。`shutil.copytree` 碰到这种条目整体抛异常，
+  `create_snapshot` 整个 `try/except Exception` 兜住 → 当天的每日完整快照直接没了，
+  而且只留一行 error，看不出是它。
+  改法（`utils.py`）：
+  - `copy_directory` 不再用 copytree，改成逐项遍历：重解析点整棵跳过
+    （junction/符号链接/OneDrive 占位），单个文件失败（被占用/ACL 拒绝/
+    正在轮转）只跳过它，目录遍历失败跳过该子树
+  - `get_directory_size` 同理，`os.walk(onerror=...)` + 逐文件 try
+  - `create_archive` 逐文件兜异常，不让一个读不了的残留文件整包失败
+  实测用一个指向 `C:\Windows\System32\config` 的 junction 复现：改前整棵树复制失败，
+  改后 junction 被识别跳过，其余文件照常复制/统计/打包
+
+- **前置启动校验长期停在 warning（改不掉的黄灯）**
+  `MD5一致性校验` 每轮都报「有 1 个文件被删除: plugins/resume-running.json」。
+  这个文件是插件"正在运行"的标记，启动时写、退出时删，天然会消失 ——
+  它被写进了 MD5 基线，于是每 65 秒一次的前置校验永远是 warning，
+  真正的告警反而看不清。补进 `MD5_EXCLUDE_FILES`。
+  实测改前 `状态: warning`，改后 `状态: passed`
+
+### 说明
+
+- 1.5.2 那三项（跨机路径自愈、测试吞失败、日志污染）已随本次一起发布
+
+---
+
 ## [1.5.2] - 2026-11-11
 
 早上一轮自检（`selfcheck.py` + 37 个测试全跑）挖出来的问题。selfcheck 本身

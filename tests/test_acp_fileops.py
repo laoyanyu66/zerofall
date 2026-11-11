@@ -42,7 +42,14 @@ with AcpClient(profile='zf-acp', cwd=str(WORK)) as cli:
         print('  set_config_option OK')
     print()
     print('=== 发任务（读+写文件）===')
-    res, text = cli.prompt(sid, TASK, timeout=420)
+    try:
+        res, text = cli.prompt(sid, TASK, timeout=420)
+    except Exception as e:
+        msg = str(e)
+        if "Insufficient Balance" in msg or "insufficient" in msg.lower():
+            print("[SKIP] ACP 实测跳过：账号余额不足（这是环境问题，不是代码缺陷）")
+            raise SystemExit(0)
+        raise
     print('  stopReason:', res.get('stopReason'))
     print()
     print('--- agent 文本 ---')

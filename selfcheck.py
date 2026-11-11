@@ -20,6 +20,7 @@
 5. 重复的顶层定义
 """
 import ast
+import json
 import os
 import re
 import sys
@@ -56,6 +57,8 @@ def check_or_zero():
             # （否则像 "`int(getattr(cfg, 'x', 20) or 20)` 这种说明文字会被误报）
             stripped = line.strip()
             if stripped.startswith('#') or '`' in line:
+                continue
+            if 'noqa: or-num' in line:
                 continue
             if pat.search(line) and '#' not in line.split('or')[0]:
                 hits.append((p.relative_to(ROOT), i, line.strip()[:96]))
@@ -257,6 +260,35 @@ def check_unused_config_fields():
         print('  [PASS] 所有 {} 个字段都有被读取'.format(len(fields)))
 
 
+def check_config_duplication():
+    """配置双份漂移：dist 与源码树各有一份 zerofall_config.json
+
+    现役的是 dist 那份（程序同级）。源码树那份只在"从源码跑"时生效，
+    两份不一致时，调试读到的值会和实际运行的不同 —— 这种坑很难现场看出来。
+    """
+    print("[9] 检查配置文件重复")
+    dist = ROOT / "dist" / "zerofall_config.json"
+    src = ROOT / "zerofall_config.json"
+    if not (dist.is_file() and src.is_file()):
+        print("  [SKIP] 只有一份配置")
+        return
+    try:
+        a = json.loads(dist.read_text(encoding="utf-8"))
+        b = json.loads(src.read_text(encoding="utf-8"))
+    except Exception as e:
+        WARN.append("配置无法解析: {}".format(e))
+        print("  [WARN] 配置解析失败: {}".format(e))
+        return
+    diff = [k for k in set(a) | set(b) if a.get(k) != b.get(k)]
+    if diff:
+        WARN.append("配置双份不一致: {} 项 ({})".format(len(diff), ", ".join(sorted(diff)[:6])))
+        print("  [WARN] dist 与源码树配置有 {} 项不同（以 dist 为现役）：{}".format(
+            len(diff), ", ".join(sorted(diff)[:6])))
+        print("  提示：从源码调试时会读到源码树那份，容易误判；建议保持一致")
+    else:
+        print("  [PASS] 两份配置一致")
+
+
 def check_syntax_all():
     print('\n[6] 全项目语法')
     bad = []
@@ -366,6 +398,7 @@ if __name__ == '__main__':
     check_unused_config_fields()
     check_bare_except_pass()
     check_version_consistency()
+    check_config_duplication()
     print()
     print('=' * 70)
     print('通过 {} / 提示 {} / 失败 {}'.format(len(PASS), len(WARN), len(FAIL)))

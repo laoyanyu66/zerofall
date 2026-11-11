@@ -28,6 +28,10 @@ from ui.dialogs import ZFMessageBox as QMessageBox
 # 加密密码按机器生成，见 modules/cloud_crypto（不再写死）
 
 
+# 密文相对明文的体积系数：Fernet/base64 约 +33%，实测 885 MB zip -> 1180 MB enc
+ENC_OVERHEAD = 1.34
+
+
 def scan_cloud(sync_dir):
     """扫描云同步目录，返回 {items, stats}
 
@@ -39,7 +43,7 @@ def scan_cloud(sync_dir):
     out = {'items': [], 'stats': {
         'total': 0, 'recoverable': 0, 'meta_only': 0,
         'light': 0, 'full': 0,
-        'disk_mb': 0.0, 'declared_mb': 0.0,
+        'disk_mb': 0.0, 'declared_mb': 0.0, 'payload_mb': 0.0,
         'orphan_meta': 0, 'missing_meta': 0, 'last_sync': '',
         'dir': str(sync_dir or ''), 'exists': False,
     }}
@@ -140,12 +144,29 @@ def scan_cloud(sync_dir):
         # 否则一堆只剩元数据的孤儿会把"占用"虚报成几十 GB
         st['disk_mb'] += it['actual_mb']
         st['declared_mb'] += (it['size_mb'] or 0.0)
+        # .enc 是加密后的密文（base64），比原文大三分之一左右；而 size_mb 记的是
+        # 压缩前目录大小或 zip 大小。两者不是同一把尺子，直接比会得出"实际占用
+        # 超过声明量 27%"这种假警报（2026-11-11 test_cloud_snapshots 就是这么红的）。
+        # 额外给一个折算回明文体量的 payload_mb，核对占用用它比。
+        if str(it.get('data_path') or '').lower().endswith('.enc'):
+            try:
+                from modules import cloud_crypto as _cc
+                ratio = _cc.payload_ratio(it['data_path'], it['actual_mb']) if it.get('data_path') else ENC_OVERHEAD
+                if not _cc.is_v2(it['data_path']):
+                    ratio = ENC_OVERHEAD
+            except Exception:
+                ratio = ENC_OVERHEAD
+            st['payload_mb'] += it['actual_mb'] / ratio
+        else:
+            st['payload_mb'] += it['actual_mb']
         if not it['has_meta']:
             st['missing_meta'] += 1
         if it['mtime'] > newest:
             newest = it['mtime']
     st['disk_mb'] = round(st['disk_mb'], 1)
     st['declared_mb'] = round(st['declared_mb'], 1)
+    st['payload_mb'] = round(st['payload_mb'], 1)
+    st['enc_overhead'] = ENC_OVERHEAD
     if newest > 0:
         st['last_sync'] = time.strftime('%Y-%m-%d %H:%M:%S',
                                         time.localtime(newest))
@@ -349,7 +370,7 @@ class CloudSnapshotsTab(QWidget):
         import tempfile
         from logger import ZeroFallLogger
         try:
-            from utils import decrypt_file
+            from utils import decrypt_file, config_int
             tmp = Path(tempfile.gettempdir())
             src = Path(it['data_path'])
             if src.name.endswith('.enc'):
@@ -441,7 +462,7 @@ class CloudSnapshotsTab(QWidget):
         import datetime as _dt
 
         try:
-            keep_days = int(getattr(self.config, 'cloud_history_keep_days', 14) or 0)
+            keep_days = config_int(self.config, 'cloud_history_keep_days', 14)
         except Exception:
             keep_days = 14
         if keep_days <= 0:

@@ -45,7 +45,14 @@ def base_dir() -> Path:
             pass
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).parent
-    return Path(__file__).parent.parent
+    # 源码模式：如果旁边已经有一份"现役"密钥库（打包版用的那份），就用它。
+    # 2026-11-11 踩过的坑：从源码跑迁移脚本时这里新生成了随机密码，于是同一批
+    # 云端快照出现"两把钥匙开不同的包"，孤儿密码所在的文件差点变成永久死数据。
+    root = Path(__file__).parent.parent
+    for cand in (root / 'dist', root / 'release'):
+        if (cand / _FILE_NAME).is_file():
+            return cand
+    return root
 
 
 def path() -> Path:

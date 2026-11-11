@@ -2,6 +2,7 @@
 """
 Settings Tab - 设置标签页
 """
+from utils import config_int
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox,
     QGridLayout, QFormLayout, QCheckBox, QLineEdit, QFileDialog,
@@ -119,7 +120,7 @@ class SettingsTab(QWidget):
         self.full_interval_spin.setSingleStep(10)
         self.full_interval_spin.setMaximumWidth(140)
         self.full_interval_spin.setValue(
-            int(getattr(self.config, 'full_snapshot_interval_minutes', 30) or 0))
+            config_int(self.config, 'full_snapshot_interval_minutes', 30))
         self.full_interval_spin.setToolTip(
             "以当天第一个完整快照为锚点，之后每隔这么多分钟再打一个。\n"
             "填 0 则关闭定时触发，改回\"每 N 个轻量快照整一个完整快照\"。\n"
@@ -190,7 +191,7 @@ class SettingsTab(QWidget):
         self.cloud_history_spin.setSuffix(" 天")
         self.cloud_history_spin.setMaximumWidth(140)
         self.cloud_history_spin.setValue(
-            int(getattr(self.config, "cloud_history_keep_days", 14) or 0))
+            config_int(self.config, 'cloud_history_keep_days', 14))
         self.cloud_history_spin.setToolTip(
             "云端只保留最近这么多天的整组快照，超期自动清理。\n"
             "填 0 = 不限制（云端会一直增长，不建议）。")
@@ -266,7 +267,7 @@ class SettingsTab(QWidget):
         mb.addWidget(self.http_server_check, 1, 0, 1, 2)
         self.http_port_spin = QSpinBox()
         self.http_port_spin.setRange(1024, 65535)
-        self.http_port_spin.setValue(int(getattr(self.config, 'http_port', 8765) or 8765))
+        self.http_port_spin.setValue(config_int(self.config, 'http_port', 8765))
         mb.addWidget(QLabel("端口:"), 1, 2)
         mb.addWidget(self.http_port_spin, 1, 3)
         self.http_token_edit = QLineEdit(getattr(self.config, 'http_token', ''))
@@ -411,7 +412,7 @@ class SettingsTab(QWidget):
         cb.addWidget(self.ftp_host_edit, _relay_row + 6, 1)
         self.ftp_port_spin = QSpinBox()
         self.ftp_port_spin.setRange(1, 65535)
-        self.ftp_port_spin.setValue(int(getattr(self.config, 'ftp_port', 21) or 21))
+        self.ftp_port_spin.setValue(config_int(self.config, 'ftp_port', 21))
         cb.addWidget(QLabel("端口:"), _relay_row + 6, 2)
         cb.addWidget(self.ftp_port_spin, _relay_row + 6, 3)
         self.ftp_user_edit = QLineEdit(getattr(self.config, 'ftp_user', ''))
@@ -530,7 +531,7 @@ class SettingsTab(QWidget):
         self.crash_countdown_spin.setSingleStep(30)
         self.crash_countdown_spin.setSuffix(" 秒")
         self.crash_countdown_spin.setValue(
-            int(getattr(self.config, "crash_restore_countdown", 600) or 0))
+            config_int(self.config, 'crash_restore_countdown', 600))
         self.crash_countdown_spin.setToolTip(
             "崩溃后弹出恢复选择框的自动倒计时。\n"
             "默认 600 秒（10 分钟）；填 0 表示不限时，必须手动点「立即恢复」。")

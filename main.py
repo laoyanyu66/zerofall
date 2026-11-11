@@ -300,6 +300,17 @@ def main():
             pass
         sys.exit(0)
     
+    # 先清掉 PyInstaller onefile 的簿记变量：任何子进程（尤其是 DSH）都不该继承，
+    # 否则从 DSH 那条链再启动 ZeroFall 会弹
+    # "Security validation failure: invalid originating onefile parent process (PID not found)!"
+    try:
+        from utils import strip_pyinstaller_env
+        _removed = strip_pyinstaller_env()
+        if _removed:
+            ZeroFallLogger.info("[环境] 已清理 PyInstaller 簿记变量: {}".format(", ".join(_removed)))
+    except Exception as _e:
+        sys.stderr.write("[ZeroFall] 清理 PyInstaller 环境变量失败: {}\n".format(_e))
+
     # 检查是否已经尝试过提权（通过命令行参数）
     already_tried = "--already-tried-admin" in sys.argv
     
@@ -346,7 +357,7 @@ def main():
         print("[警告] 设置应用图标失败: {}".format(_e))
 
     app.setApplicationName("ZeroFall")
-    app.setApplicationVersion("1.5.2")
+    app.setApplicationVersion("1.6.0")
     
     # 全局异常钩子：子控角色下自动上报给主控
     _install_error_reporter()

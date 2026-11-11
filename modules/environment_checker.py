@@ -31,6 +31,8 @@ MD5_CORE_PATTERNS = [
 def _is_core_file(path: str) -> bool:
     """判断路径是否属于核心配置（改动将判为异常）"""
     p = path.replace('\\', '/').lower()
+    if any(tok in p for tok in ('.bak', '.orig', '.rej', '.zf-tmp', '.zf-conflict')):
+        return False        # 备份/临时文件不是环境状态
     return any(c.lower() in p for c in MD5_CORE_PATTERNS)
 
 
@@ -56,6 +58,10 @@ MD5_EXCLUDE_FILES = [
     '*.log', '*.jsonl', '*.tmp', '*.pyc', '*.pyo',
     'applied.json', 'update-status.json',
     '*.db-journal', '*.db-wal',
+    # 备份文件永远不该算"环境状态"：它们是改前副本，清理掉是正常维护，
+    # 而 reference 是 cordis.patch.yml.bak-before-* 这种名字里带核心文件名的，
+    # 会被 _is_core_file 判成核心 → 清理一次 .bak 就让健康度永久报错（2026-11-11）。
+    '*.bak', '*.bak-*', '*.orig', '*.rej', '*.zf-tmp', '*.zf-conflict',
     '.DS_Store', 'Thumbs.db',
     # ── DSH / 插件运行时状态 ──
     # 这些文件每次操作或切换会话都会重写，含义是"程序在跑"，
@@ -63,6 +69,9 @@ MD5_EXCLUDE_FILES = [
     # 变更检测被打穿，快照暴涨（1.5 小时能堆 17 个）。
     'last-cwd.txt',         # dsh-purge：当前工作目录
     'installed-rev',        # dsh-purge：已安装版本标记
+    'resume-running.json',  # 插件启动时写、退出时删的"正在运行"标记，
+                            # 不排除的话每次重启都会报"有 1 个文件被删除"，
+                            # 前置校验长期停在 warning
     'preset-declare.json',  # 插件会话声明
     'cordis.yml',           # DSH 会话配置（切会话就重写）
     'cordis.yaml',
@@ -493,10 +502,32 @@ class EnvironmentChecker:
             # 结果就是：一条永远消不掉的黄色警告挂在界面上，冲淡了真正需要处理的
             # 失败项。所以降级成 PASSED，把完整数值和建议留在 detail 里，
             # 用户想知道时点开能看见，但不再干扰总体结论。
+            # 补一句"配置了但还没生效"的提示：Win32_PageFileSetting 里可能有别的盘的
+            # 页面文件已配好、但 pagefile.sys 还没创建（要重启才生效）。本机就是
+            # C: 2 GB + E: 已配 16-32 GB 但文件不存在，只看实际值会让人以为没救。
+            try:
+                import os as _os
+                pending = []
+                _out = __import__("subprocess").run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance Win32_PageFileSetting | ForEach-Object { $_.Name + '|' + $_.InitialSize + '|' + $_.MaximumSize }"],
+                    capture_output=True, text=True, timeout=8).stdout or ""
+                for _line in _out.splitlines():
+                    _parts = _line.strip().split("|")
+                    if len(_parts) >= 3 and _parts[0] and not _os.path.exists(_parts[0]):
+                        pending.append("{}（{}-{} MB）".format(_parts[0], _parts[1], _parts[2]))
+                if pending:
+                    detail += "。另有已配置但尚未生效的页面文件：{} —— 重启后生效".format("、".join(pending))
+            except Exception:
+                pass
+
             if pf_gb < 2.0 or ratio < 0.15:
                 return CheckItem(
                     "系统资源", CheckResult.PASSED,
-                    "页面文件 {:.2f} GB（占物理 {:.0%}，偏小）".format(pf_gb, ratio),
+                    "页面文件 {:.2f} GB（占物理 {:.0%}，偏小）{}".format(
+                        pf_gb, ratio,
+                        "；另有已配置的页面文件重启后生效"
+                        if "另有已配置但尚未生效" in detail else ""),
                     detail + "。提示：页面文件偏小时，内存吃紧的系统会直接终止进程，"
                              "表现为 ZeroFall 突然消失、日志里没有退出记录。"
                              "如需根治，在「系统属性 → 高级 → 性能设置 → 高级 → 虚拟内存」"

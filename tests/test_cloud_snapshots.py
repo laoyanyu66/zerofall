@@ -194,9 +194,13 @@ def main():
         print('  最后同步: {}'.format(st['last_sync'] or '-'))
         chk(st['total'] > 0, '真实目录能扫出记录', st['total'])
         chk(st['exists'] is True, '目录被识别为存在')
-        chk(st['disk_mb'] <= st['declared_mb'] * 1.2 or st['declared_mb'] == 0,
-            '实际占用没有离谱地超过声明量',
-            '{:.1f} vs {:.1f}'.format(st['disk_mb'], st['declared_mb']))
+        # .enc 是 base64 密文，比明文大 1/3（实测 885 MB zip -> 1180 MB enc）；
+        # size_mb 记的又是压缩前目录大小/zip 大小。两把尺子直接比必然"超标"，
+        # 所以用 scan_cloud 折算出的 payload_mb 比，系数写在 ENC_OVERHEAD 里。
+        compare_mb = st.get('payload_mb', st['disk_mb'])
+        chk(compare_mb <= st['declared_mb'] * 1.2 or st['declared_mb'] == 0,
+            '实际占用没有离谱地超过声明量（密文已按 {:.2f}x 折算）'.format(st.get('enc_overhead', 1.0)),
+            '{:.1f} vs {:.1f}'.format(compare_mb, st['declared_mb']))
     else:
         print('  跳过：真实目录不存在')
         chk(True, '（跳过真实目录检查）')

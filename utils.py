@@ -6,6 +6,8 @@ import os
 import shutil
 import json
 import zipfile
+import fnmatch
+import stat
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -205,31 +207,104 @@ def decrypt_file(input_path: str, output_path: str, password: str) -> bool:
         return False
 
 def get_directory_size(dir_path: str) -> float:
-    """获取目录大小（MB）"""
+    """获取目录大小（MB）
+
+    逐项统计并跳过读不了的条目：目录里只要有一个重解析点（junction/OneDrive）
+    或 ACL 拒绝的目录，rglob 就会整体抛 PermissionError，调用方拿不到大小
+    还算好的——快照流程里这一抛等于整次快照报废。
+    """
     total_size = 0
     dir_path = Path(dir_path)
-    
+
     if not dir_path.exists():
         return 0.0
-    
-    for file_path in dir_path.rglob("*"):
-        if file_path.is_file():
-            total_size += file_path.stat().st_size
-    
+
+    def _onerror(_err):
+        return
+
+    for root, dirs, files in os.walk(dir_path, onerror=_onerror):
+        # 重解析点（junction/符号链接）不进，否则会去统计别人家的整个目录
+        dirs[:] = [d for d in dirs if not _is_reparse_point(Path(root) / d)]
+        for name in files:
+            try:
+                total_size += (Path(root) / name).stat().st_size
+            except OSError:
+                continue
+
     return total_size / (1024 * 1024)
 
-def copy_directory(src: str, dst: str, ignore_patterns: List[str] = None) -> bool:
-    """复制目录"""
+
+def _is_reparse_point(path: Path) -> bool:
+    """判断是否是重解析点（junction / 符号链接 / OneDrive 占位目录）
+
+    为什么必须判：Windows 上 junction 对 os.walk 就是个普通目录，跟进去会
+    复制/统计一整棵别人的目录；读不动的时候直接 WinError 5。
+    实测快照失败就是栽在 DSH 会话目录里一个 %userprofile%\\OneDrive 上。
+    """
     try:
-        if ignore_patterns:
-            ignore = shutil.ignore_patterns(*ignore_patterns)
-        else:
-            ignore = None
-        
-        shutil.copytree(src, dst, ignore=ignore, dirs_exist_ok=True)
+        if path.is_symlink():
+            return True
+        attrs = getattr(path.lstat(), 'st_file_attributes', 0)
+        return bool(attrs & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+    except OSError:
+        # 连 stat 都失败（ACL 拒绝）就当它不可用，跳过
         return True
-    except Exception as e:
+
+
+def copy_directory(src: str, dst: str, ignore_patterns: List[str] = None) -> bool:
+    """复制目录（逐项容错）
+
+    不用 shutil.copytree 的原因：copytree 碰到一个读不了的条目就整体抛异常，
+    调用方只拿到一份残缺目录 + 一句"失败"，而快照流程里这一抛等于整次快照
+    丢掉（实测：[WinError 5] 拒绝访问 ...\\sessions\\%userprofile%\\OneDrive，
+    当天的每日完整快照就这么没了）。
+
+    现在的语义：
+      * 重解析点（junction/符号链接/OneDrive 占位）整棵跳过，不跟进去
+      * 单个文件复制失败（被占用/ACL 拒绝/正在轮转）只跳过它，其余照常
+      * 目录无法遍历时跳过该子树
+    返回 True 表示"复制流程跑完"，不代表逐字节完整。
+    """
+    try:
+        src_p = Path(src)
+        dst_p = Path(dst)
+        if not src_p.is_dir():
+            return False
+        dst_p.mkdir(parents=True, exist_ok=True)
+    except OSError:
         return False
+
+    pats = list(ignore_patterns or [])
+
+    def _ignored(name: str) -> bool:
+        return any(fnmatch.fnmatch(name, p) for p in pats)
+
+    def _onerror(_err):
+        return
+
+    for root, dirs, files in os.walk(src_p, onerror=_onerror):
+        root_p = Path(root)
+        rel = root_p.relative_to(src_p)
+        target_root = dst_p / rel if str(rel) != '.' else dst_p
+        # 剪掉不该跟的目录：忽略规则 + 重解析点
+        dirs[:] = [d for d in dirs
+                   if not _ignored(d) and not _is_reparse_point(root_p / d)]
+        try:
+            target_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            dirs[:] = []
+            continue
+        for name in files:
+            if _ignored(name):
+                continue
+            s = root_p / name
+            if _is_reparse_point(s):
+                continue
+            try:
+                shutil.copy2(str(s), str(target_root / name))
+            except OSError:
+                continue
+    return True
 
 # 这些扩展名的内容本身已经是压缩/加密过的（熵很高），再 DEFLATE 几乎不缩小，
 # 只是白烧 CPU。实测一个完整快照里 .zstd 占 26.7%、.tgz/.png/.whl/.enc 再 4%，
@@ -254,18 +329,31 @@ def create_archive(source_dir: str, output_path: str, compression: str = "zip") 
     """创建压缩包
 
     逐文件选压缩方式：已压缩格式原样存储，其余 DEFLATE。
+
+    逐文件也逐个兜异常：打包时文件被删/被占用/ACL 拒绝都只跳过那一个，
+    不让一个读不了的残留文件把整次快照打成失败。
     """
+    skipped = 0
+
+    def _onerror(_err):
+        return
+
     try:
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(source_dir):
+            for root, dirs, files in os.walk(source_dir, onerror=_onerror):
+                dirs[:] = [d for d in dirs if not _is_reparse_point(Path(root) / d)]
                 for file in files:
                     file_path = Path(root) / file
-                    arcname = file_path.relative_to(source_dir)
-                    method = (zipfile.ZIP_STORED if _is_already_compressed(file_path)
-                              else zipfile.ZIP_DEFLATED)
-                    zipf.write(file_path, arcname, compress_type=method)
+                    try:
+                        arcname = file_path.relative_to(source_dir)
+                        method = (zipfile.ZIP_STORED if _is_already_compressed(file_path)
+                                  else zipfile.ZIP_DEFLATED)
+                        zipf.write(file_path, arcname, compress_type=method)
+                    except (OSError, ValueError):
+                        skipped += 1
+                        continue
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 def extract_archive(archive_path: str, output_dir: str) -> bool:
@@ -374,3 +462,59 @@ def kill_process(process_name: str) -> bool:
         return True
     except:
         return False
+
+# ── PyInstaller onefile 环境隔离 ─────────────────────────────────────────────
+# 事故复盘（2026-11-11）：
+#   ZeroFall 是 PyInstaller onefile 打包，运行中环境里带着
+#   _PYI_PARENT_PROCESS_LEVEL / _PYI_ARCHIVE_FILE / _PYI_APPLICATION_HOME_DIR。
+#   它启动 DSH 时这些变量被继承下去；再从那条链里启动 ZeroFall，新进程的
+#   bootloader 会以为自己是"onefile 子进程"，去找一个早已退出的父 PID，弹：
+#     Security validation failure: invalid originating onefile parent process (PID not found)!
+#   修法：自己启动时清一遍，且给所有子进程传一份干净 env。
+
+_PYI_ENV_KEYS = (
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_SPLASH_IPC",
+    "_MEIPASS",
+    "_MEIPASS2",
+)
+
+
+def sanitized_child_env() -> Dict[str, str]:
+    """给子进程用的环境：去掉 PyInstaller onefile 的簿记变量"""
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith("_PYI_") or k in _PYI_ENV_KEYS:
+            env.pop(k, None)
+    return env
+
+
+def strip_pyinstaller_env() -> list:
+    """清掉**当前进程**环境里的 PyInstaller 簿记变量，返回被删掉的键名
+
+    必须在启动任何子进程之前调用：否则 DSH 会继承这些变量，
+    再从那条链启动 ZeroFall 就会撞上 "invalid originating onefile parent process"。
+    """
+    removed = []
+    for k in list(os.environ):
+        if k.startswith("_PYI_") or k in _PYI_ENV_KEYS:
+            os.environ.pop(k, None)
+            removed.append(k)
+    return removed
+
+
+def config_int(obj, name: str, default: int = 0) -> int:
+    """读配置里的整数，显式区分 None / 空串 / 0
+
+    为什么不用 `int(getattr(cfg, name, d) or 0)`：那样 `0` 和 `None` 混在一起，
+    "用户设 0 = 禁用"和"没设过"看起来一样。这里只有 None/空串才回落默认值。
+    """
+    val = getattr(obj, name, None)
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return int(default)
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return int(default)

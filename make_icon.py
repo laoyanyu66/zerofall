@@ -196,23 +196,33 @@ def build_simple():
     return img
 
 
-def main():
-    big = build()
+def main(style='simple'):
+    """生成全部图标资源
+
+    style='simple'   —— 单环 + 中心点（托盘上看到的那个骨架），所有尺寸统一用它
+    style='detailed' —— 双弧螺旋 + 缺口端点 + 辉光（早期大尺寸版本）
+
+    2026-11-11 起默认 'simple'：原来 ico 里 ≤32px 用简化版、≥48px 用细节版，
+    结果托盘是单环、桌面/任务栏是双弧，同一个人两副脸。统一成单环后，
+    托盘/任务栏/桌面快捷方式/资源管理器/窗口标题栏看到的是同一个符号。
+    """
+    renderer = build_simple if style == 'simple' else build
+    big = renderer()
     out_dir = os.path.dirname(os.path.abspath(__file__))
+    print('  风格:', style)
 
     # 预览 PNG（256）
     preview = big.resize((BASE, BASE), Image.LANCZOS)
     preview.save(os.path.join(out_dir, 'icon_preview.png'))
     print('  预览:', os.path.join(out_dir, 'icon_preview.png'))
 
-    # 多尺寸 ico
+    # icon.png（256）：打包脚本与任何引用它的地方也必须是同一个符号
+    preview.save(os.path.join(out_dir, 'icon.png'))
+    print('  主图:', os.path.join(out_dir, 'icon.png'))
+
+    # 多尺寸 ico：每一帧都由同一渲染器缩出，避免"小尺寸另一套设计"
     sizes = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)]
-    # 小尺寸用简化版单独绘制：把大图缩到 16px 只会得到一团噪点
-    small_src = build_simple()
-    frames = []
-    for s in sizes:
-        src = small_src if s[0] <= 32 else big
-        frames.append(src.resize(s, Image.LANCZOS))
+    frames = [big.resize(s, Image.LANCZOS) for s in sizes]
     ico_path = os.path.join(out_dir, 'ZeroFall.ico')
     frames[0].save(ico_path, format='ICO', sizes=sizes,
                    append_images=frames[1:])
@@ -220,11 +230,21 @@ def main():
 
     # 各尺寸单独出图，便于核对小图标是否糊
     for s in (16, 32, 48, 64):
-        p = os.path.join(out_dir, 'icon_{}.png'.format(s))
-        src = small_src if s <= 32 else big
-        src.resize((s, s), Image.LANCZOS).save(p)
+        big.resize((s, s), Image.LANCZOS).save(
+            os.path.join(out_dir, 'icon_{}.png'.format(s)))
     print('  小尺寸样张已生成: icon_16/32/48/64.png')
 
 
 if __name__ == '__main__':
-    main()
+    style = 'simple'
+    for i, a in enumerate(sys.argv[1:]):
+        if a in ('--style',) and i + 2 <= len(sys.argv) - 1:
+            style = sys.argv[i + 2]
+        elif a.startswith('--style='):
+            style = a.split('=', 1)[1]
+        elif a in ('detailed', 'simple'):
+            style = a
+    if style not in ('simple', 'detailed'):
+        print('用法: python make_icon.py [--style simple|detailed]')
+        raise SystemExit(2)
+    main(style)
