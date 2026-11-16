@@ -16,6 +16,35 @@ from PyQt6.QtGui import QPalette, QColor
 sys.path.insert(0, str(Path(__file__).parent))
 
 
+# ── 子进程静默：所有控制台子进程都不许弹窗口 ──────────────────────────────
+# ZeroFall 以管理员身份运行，它 spawn 的 powershell.exe / netstat.exe /
+# tasklist.exe 每个都会新开一个真控制台窗口，标题是
+# "管理员: C:\windows\System32\WindowsPowerShell\v1.0\powershell.exe"。
+# resume 页签每 5 秒刷新一次 overview() → discover_port()，于是屏幕上每 5 秒
+# 闪两个黑框，层叠堆在左上角，越堆越乱。
+#
+# 在这里给进程内所有 Popen 补 CREATE_NO_WINDOW，一次性覆盖全部调用点
+# （包括 psutil、node 子进程、以及以后新加的代码），不必逐个去改。
+# 效果：控制台类子进程不再创建窗口；GUI 子进程（DeepSeek/豆包）不受影响，
+# 它们自己的窗口照常显示。
+import subprocess as _subprocess
+
+_CREATE_NO_WINDOW = 0x08000000
+_DETACHED_PROCESS = 0x00000008
+
+if os.name == "nt":
+    _popen_init_orig = _subprocess.Popen.__init__
+
+    def _popen_init_no_window(self, *args, **kwargs):
+        flags = kwargs.get("creationflags") or 0
+        if not (flags & (_CREATE_NO_WINDOW | _DETACHED_PROCESS)):
+            kwargs["creationflags"] = flags | _CREATE_NO_WINDOW
+        return _popen_init_orig(self, *args, **kwargs)
+
+    _popen_init_no_window.__wrapped__ = _popen_init_orig
+    _subprocess.Popen.__init__ = _popen_init_no_window
+
+
 def _app_id_for_this_exe() -> str:
     """按 exe 绝对路径生成 AppUserModelID
 
@@ -357,7 +386,7 @@ def main():
         print("[警告] 设置应用图标失败: {}".format(_e))
 
     app.setApplicationName("ZeroFall")
-    app.setApplicationVersion("1.6.0")
+    app.setApplicationVersion("1.6.6")
     
     # 全局异常钩子：子控角色下自动上报给主控
     _install_error_reporter()

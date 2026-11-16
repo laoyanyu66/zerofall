@@ -391,13 +391,120 @@ def credential_diagnosis(dsh_home: Path) -> str:
         src)
 
 
+# dsh CLI 相对安装目录的位置（resources 之下一层）
+_CLI_TAIL = ('dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+# 安装布局候选：老版是解包的 resources\app，新版打包成 resources\app.asar
+_LAYOUT_DIRS = ('app', 'app.asar', 'app.asar.unpacked')
+
+
+def _install_roots(hint: str = '') -> list:
+    """DeepSeek 安装根目录候选（去重保序）"""
+    roots = []
+    if hint:
+        p = Path(hint)
+        roots.append(p if p.is_dir() else p.parent)
+    env_exe = os.environ.get('DSH_EXE') or os.environ.get('DEEPSEEK_EXE')
+    if env_exe:
+        roots.append(Path(env_exe).parent)
+    for cand in (r'D:\DeepSeek', r'C:\Program Files\DeepSeek',
+                 r'C:\Program Files (x86)\DeepSeek'):
+        if Path(cand).is_dir():
+            roots.append(Path(cand))
+    la = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs'
+    if la.is_dir():
+        for sub in la.iterdir():
+            if 'deepseek' in sub.name.lower():
+                roots.append(sub)
+    seen, out = set(), []
+    for r in roots:
+        k = str(r).lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
+
+
+def resolve_dsh_cli(exe_hint: str = '') -> dict:
+    """定位 dsh CLI 可执行方式。
+
+    返回 {'argv0', 'script', 'env', 'kind', 'path'}：
+      * kind='node'     → 用 runtime 自带的 node.exe 直接跑 bin.js
+      * kind='electron' → bin.js 在 app.asar 里，普通 node 读不了 asar，
+                          改用 Electron 的 ELECTRON_RUN_AS_NODE 模式跑
+
+    为什么要两种：DSH 新版把 resources\\app 打成了 resources\\app.asar，
+    `Path.exists()` 对 asar 内部路径恒为 False，但 Electron 打过 asar 补丁的 fs
+    能正常 require —— 所以只能用宿主 exe 当 node 用。
+    """
+    override = os.environ.get('DSH_CLI')
+    if override and Path(override).exists():
+        node = _pick_node()
+        return {'argv0': str(node or 'node'), 'script': override,
+                'env': {}, 'kind': 'node', 'path': override}
+
+    for root in _install_roots(exe_hint):
+        res = root / 'resources'
+        if not res.is_dir():
+            continue
+        for layout in _LAYOUT_DIRS:
+            base = res / layout
+            cli = base.joinpath(*_CLI_TAIL)
+            if layout.endswith('.asar'):
+                # asar 内部路径不可 stat，只验证归档本身存在
+                if not base.is_file():
+                    continue
+                exe = _find_host_exe(root)
+                if exe:
+                    return {'argv0': str(exe), 'script': str(cli),
+                            'env': {'ELECTRON_RUN_AS_NODE': '1'},
+                            'kind': 'electron', 'path': str(cli)}
+            elif cli.is_file():
+                node = _pick_node()
+                if node:
+                    return {'argv0': str(node), 'script': str(cli),
+                            'env': {}, 'kind': 'node', 'path': str(cli)}
+    raise AcpError('找不到 dsh CLI（已尝试 resources\\app 与 resources\\app.asar 布局）')
+
+
+def _pick_node():
+    """优先 runtime 自带 node（版本与 DSH 对齐），退化到 PATH 上的 node"""
+    home = Path(os.environ.get('USERPROFILE', '')) / '.dsh'
+    cands = [home / 'dsh-runtimes' / 'dsh-primary-runtime' / 'dependencies'
+             / 'node' / 'bin' / 'node.exe']
+    if home.is_dir():
+        rt = home / 'dsh-runtimes'
+        if rt.is_dir():
+            for sub in rt.iterdir():
+                cands.append(sub / 'dependencies' / 'node' / 'bin' / 'node.exe')
+    for c in cands:
+        if c.is_file():
+            return c
+    return None
+
+
+def _find_host_exe(root: Path):
+    for name in ('DeepSeek Harness.exe', 'DeepSeek.exe'):
+        p = root / name
+        if p.is_file():
+            return p
+    try:
+        for p in root.glob('*.exe'):
+            if 'deepseek' in p.name.lower():
+                return p
+    except Exception:
+        pass
+    return None
+
+
 class AcpClient:
     """DSH ACP stdio 客户端（一次任务一个实例，用完即弃）"""
 
-    def __init__(self, profile: str = 'zf-acp', cwd: str = None, timeout: int = 900):
+    def __init__(self, profile: str = 'zf-acp', cwd: str = None, timeout: int = 900,
+                 config=None):
         self.profile = profile
         self.cwd = cwd or str(Path.cwd())
         self.timeout = timeout
+        self.config = config
         self.proc = None
         self._rid = 0
         self._responses = []
@@ -407,18 +514,20 @@ class AcpClient:
 
         home = Path(os.environ.get('USERPROFILE', '')) / '.dsh'
         self.dsh_home = home
-        self.node = home / 'dsh-runtimes' / 'dsh-primary-runtime' / 'dependencies' / 'node' / 'bin' / 'node.exe'
-        self.bin = Path(r'D:\DeepSeek\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js')
+        # 启动信息在 start() 里解析（install 目录可能整包更新，不能缓存死路径）
+        self.node = None
+        self.bin = None
+        self.launcher = None
 
     # ── 生命周期 ────────────────────────────────────────────────
     def start(self):
-        if not self.node.exists():
-            raise AcpError('找不到 node: {}'.format(self.node))
-        if not self.bin.exists():
-            raise AcpError('找不到 dsh CLI: {}'.format(self.bin))
+        cli = resolve_dsh_cli(self.config and getattr(self.config, 'deepseek_exe_path', '') or '')
         env = load_credential_env(self.dsh_home)
+        env.update(cli.get('env') or {})
+        self.bin = Path(cli['script'])
+        self.launcher = Path(cli['argv0'])
         self.proc = subprocess.Popen(
-            [str(self.node), str(self.bin), '--profile', self.profile],
+            [str(self.launcher), str(self.bin), '--profile', self.profile],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env=env, cwd=self.cwd, bufsize=0,
         )

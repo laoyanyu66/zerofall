@@ -50,11 +50,43 @@ FIX_PROMPT = """你是 ZeroFall（DeepSeek Harness 守护/快照/回退工具）
 现在开始。
 """
 
-FIX_BUILD_CMD = [
-    'pyinstaller', '--onefile', '--windowed', '--icon=ZeroFall.ico',
+BUILD_ARGS = [
+    '--onefile', '--windowed', '--icon=ZeroFall.ico',
     '--add-data', 'ZeroFall.ico;.', '--name=ZeroFall', 'main.py',
     '--clean', '--noconfirm',
 ]
+
+
+# 打包命令的显式覆盖位。默认 None = 按运行时探测（见 build_cmd）。
+# 留着它是为了让测试和故障演练能把打包换成一条假命令，验证「失败怎么上报、
+# 成功怎么装」的调度链路，而不必真跑一遍 PyInstaller。
+FIX_BUILD_CMD = None
+
+
+def build_cmd():
+    """组装 pyinstaller 打包命令。
+
+    为什么不再写死 'pyinstaller'：它只是装在 Scripts\\ 里的一个入口脚本，
+    能不能拉到完全取决于 PATH。这台机器的 PATH 被随附运行时顶掉了，
+    `pyinstaller` 不在上面，打包就以「[WinError 2] 系统找不到指定的文件」
+    失败 —— 而 PyInstaller 本身明明装在当前解释器里（import 得到）。
+    所以优先用 `-m PyInstaller`：解释器在哪，它就在哪。
+
+    冻结成 exe 之后 sys.executable 是 exe 自己，没法跑 -m，
+    这时才退回 PATH 上的入口脚本。
+
+    FIX_BUILD_CMD 非空时直接用它 —— 覆盖位优先于探测。
+    """
+    if FIX_BUILD_CMD:
+        return list(FIX_BUILD_CMD)
+    if not getattr(sys, 'frozen', False):
+        try:
+            import importlib.util
+            if importlib.util.find_spec('PyInstaller') is not None:
+                return [sys.executable, '-m', 'PyInstaller'] + BUILD_ARGS
+        except Exception:
+            pass
+    return ['pyinstaller'] + BUILD_ARGS
 
 # 从报错文本里挑出可能相关的源文件
 _FILE_HINT_RE = re.compile(
@@ -466,16 +498,25 @@ class MasterNode:
         if not (src / 'main.py').exists():
             return {'ok': False, 'error': '找不到源码 main.py（目录 {}）'.format(src)}
         exe_out = src / 'dist' / 'ZeroFall.exe'
+        cmd = build_cmd()
         try:
             r = subprocess.run(
-                FIX_BUILD_CMD, cwd=str(src), capture_output=True, text=True,
+                cmd, cwd=str(src), capture_output=True, text=True,
                 encoding='utf-8', errors='replace', timeout=1800,
             )
             if not exe_out.exists():
-                return {'ok': False, 'error': '打包未产出 exe', 'stderr': (r.stderr or '')[-1500:]}
-            return {'ok': True, 'exe': str(exe_out), 'stderr': (r.stderr or '')[-500:]}
+                return {'ok': False, 'error': '打包未产出 exe', 'cmd': ' '.join(cmd[:3]),
+                        'stderr': (r.stderr or '')[-1500:]}
+            return {'ok': True, 'exe': str(exe_out), 'cmd': ' '.join(cmd[:3]),
+                    'stderr': (r.stderr or '')[-500:]}
+        except FileNotFoundError as e:
+            # 报错要能自解释：光一句 WinError 2 看不出缺的是哪个程序。
+            return {'ok': False, 'cmd': ' '.join(cmd),
+                    'error': '打包程序找不到（{}）；已尝试：{}。'
+                             'PyInstaller 装在解释器里时请用 `python -m PyInstaller`。'
+                             .format(e, ' '.join(cmd[:3]))}
         except Exception as e:
-            return {'ok': False, 'error': str(e)}
+            return {'ok': False, 'cmd': ' '.join(cmd[:3]), 'error': str(e)}
 
     def next_version(self):
         """版本号递增：1.2.3 -> 1.2.4"""

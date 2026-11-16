@@ -263,7 +263,7 @@ class PluginTab(QWidget):
             "将对插件执行{}操作：\n\n{}\n\n"
             "{}后需要重启 DeepSeek 才生效。\n"
             "操作前会自动创建快照，可随时回退。\n\n"
-            "确定继续？".format(name, action),
+            "确定继续？".format(action, name, action),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )

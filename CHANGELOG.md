@@ -9,6 +9,289 @@
 
 ---
 
+## [未发布]
+
+### 新增
+
+- **崩溃「保留现场」后自动交给豆包**：dsh 崩溃且选择不回退快照（或已关自动回退、或多次回退后
+  选择停手）时，自动做一次本机 GUI 接力 —— 拉起豆包 → `Ctrl+N` 新对话 → 粘贴
+  「dsh又崩溃了，帮我分析一下是什么原因，并帮我修复优化一下」+ 现场信息（退出码 / 崩溃日志路径 /
+  profile）→ 回车发送。任何一步失败都会把提示词留在剪贴板，手动 `Ctrl+V` 即可；
+  支持 `doubao_relay_on_crash` 开关、自定义豆包路径与自定义文案。
+- **会话续跑页签（融合 dsh-resume-sessions）**：dsh 崩溃或被强制重启后，把「关闭前正在跑」
+  的会话接上。插件在 `agent/status` 变化的那一帧就把谁在跑写进 `~/.dsh/resume-sessions.json`；
+  重启后只把 `status=running`（或有 active goal）的会话恢复成 live，日志里还有未关闭 turn
+  的再补一条"继续"。idle 的历史会话永远不进候选 —— 不做"一重启全量重开"。
+  ZeroFall 侧负责三件事：内置插件源码（`modules/payload/dsh-resume-sessions/`）、一键自愈
+  （vendor / 依赖声明 / node_modules 链接 / patch 行 + `enabled: true`）、快照备份与还原，
+  并自动找到 host 端口后直接 `POST /resume-sessions/restore`。
+  插件侧自带崩溃防护：`maxSessions: 1` + 2.5s 间隔 + 8MB 单会话日志上限，外加
+  「上次恢复把进程带走」的降级刹车（连续两次就停掉自动恢复，只留手动补跑）。
+
+### 变更
+
+- **会话续跑：修掉「重启后什么都没恢复」的根因**：插件原来在 `agent/disposed` 里直接把
+  状态写成 `disposed`，而桌面端正常退出时**每个** live agent 都会收到 disposed ——
+  于是"关闭前还在跑"的记录被自己抹掉，下次启动的候选永远是空的。
+  现在 running 用独立布尔记录，disposed 时保留 `interrupted` 标记（只在当时确实在跑才置位），
+  候选 = running / interrupted / active goal 三者之一。
+  同时把快照里的标题改为从投影缓存读（`header.title` 通常是空的），并跳过从没发过 prompt
+  的空白会话 —— 这类会话没有标题，恢复出来只会在侧栏显示工作区名，看着像"标题被顶掉了"。
+  单次恢复上限从 1 调到 2（仍在 `maxSessions` 里可调，崩溃降级与 8MB 日志上限不变）。
+- **快照页自动刷新（默认开启，5 秒）**：静默 / 变更点 / 定时完整快照全在后台线程里打，
+  页面原来只在手动点「刷新」或某个前台动作之后才重建列表 —— 于是一整天明明在存快照，
+  界面最上面还停在最后一次手动刷新的时刻，看起来像"程序不存快照了"。
+  现在按索引文件 `(mtime, size)` 指纹判断，真变了才重建表格；重建时按 snapshot id
+  还原选中行与滚动位置，不会把正在挑的那一行刷掉；模态框（恢复/删除/对比确认）打开时跳过。
+- 按钮行新增「自动刷新」开关与「已同步 HH:MM:SS」时间戳，把"没有新快照"和"列表没刷新"
+  两种情况区分开；开关状态写回配置。
+- 后台每打完一个快照（变更点 / 定时完整 / 每日首次 / DSH 升级基线）立刻通知快照页刷新，
+  不用等下一轮定时；Dashboard「快速快照」同步刷新快照页。
+- 新增配置项 `snapshot_auto_refresh`（默认 `true`）、`snapshot_auto_refresh_seconds`（默认 `5`，
+  夹在 2~120 秒）。
+
+### 测试
+
+- 新增 `tests/test_snapshot_autorefresh.py`（17 项）：默认开启、无变化不重建、后台新增后自动出现、
+  自动刷新保住选中行、强制刷新、关掉开关即停、重开立刻补一次。
+- 新增 `tests/test_snapshot_dedupe.py`（37 项）：同内容大文件只存一份、小文件与同尺寸异内容不误去重、
+  恢复补齐副本且幂等、运行时垃圾（`*.pma` / `load_statistics.db*` / `relay-logs` / `SmartScreen` /
+  `Crashpad` / 轮转日志）不进包、心跳文件重写不改指纹而真实插件改动仍然改指纹、两张排除表同源。
+
+---
+
+## [1.6.6] - 2026-11-16
+
+### 修复（面板逐页自检抓到的）
+
+- **插件页「启用/禁用」按钮点了必崩**：确认框文案有 3 个 `{}` 占位符却只传了
+  `(name, action)` 两个实参 → `IndexError: Replacement index 2 out of range`。
+  也就是说这个按钮从上线起就没成功执行过。已改为 `(action, name, action)`。
+- **同一秒连建两份快照会撞 id**：`generate_snapshot_id()` 精确到秒，第二份直接
+  覆盖第一份的目录/包，索引里只剩一条 —— 一份快照被静默吞掉。现在撞 id 时按秒
+  往后挪到不冲突（时间戳仍保持 `snapshot_YYYYmmdd_HHMMSS` 格式）。
+- **会话续跑页的"使用已运行的 DSH 端点（自动找端口）"复选框是假的**：全代码没有
+  任何地方读它的值，页签永远自动探测。换成一行说明文字"端点：自动探测本机在跑的 DSH"，
+  不再承诺不存在的选项。
+
+### 自检方法（可复现）
+
+- 静态：AST 扫 `"…".format(...)` 占位符与实参数量（全库只此 1 处不匹配）；
+  AST 扫可交互控件"创建了从没被读值"（只剩上述假开关）；
+  控件 → 信号连接（`QObject.receivers` 实测，排除主窗口外部接线）。
+- 动态（offscreen，全在临时目录）：9 个页签逐个构造 + 只读刷新方法 + 内容断言；
+  9 个侧栏页签逐个切换；只读按钮真点（刷新/校验/诊断/会话扫描）；
+  设置页 54 个控件"改值→保存→落盘→重开页面回显"闭环；写操作按钮实测
+  （首页快速快照、快照页新建/删除、插件页备份、崩溃恢复对话框构造）。
+
+### 测试
+
+- 新增 `tests/test_ui_panel_smoke.py` **10 项**（插件启停不再崩、同秒建包不撞 id、
+  假开关已移除）。
+- 回归 18 组全绿（含 config_center_ui 52、cloud_window 58、sessions_in_full 19）；
+  `selfcheck.py` 通过 9 / 提示 0 / 失败 0。
+
+---
+
+## [1.6.5] - 2026-11-16
+
+### 修复
+
+- **`backup_session_data` 以前名存实亡**：`_should_include_sessions()` 收的是
+  `include_runtime`（真实含义是"运行时版本变了没有"，未变就跳过 primary-runtime 省盘），
+  于是只有"换 DSH 版本那天"的完整快照才带会话 —— 实测 **52 份快照里只有 1 份**有 `sessions/`
+  （`snapshot_20261116_000355`：181 文件 / 128.41 MB 原始、126.65 MB 压缩）。
+  现在判据改成"这份是不是完整快照"：**每份完整快照都带会话，轻量快照都不带**。
+  新增 `create_snapshot(include_sessions=...)` 供调用方显式覆盖。
+
+### 变更
+
+- **带会话的完整快照按"大包"管理**：
+  - 保留策略：`snapshot_is_full_grade()` = 含运行时 **或** 带会话 → 吃 `max_full_snapshots`；
+    既无运行时也无会话的老"完整快照"（20-80 MB）仍按轻量口径（宽松档 96 个才真删），
+    不会再出现"完整快照超出配置 21/12"这种误报。
+  - 云端：大包只留最新 `cloud_full_runtime_keep` 份，且**独占那一轮窗口**（~140 MB 的会话包
+    同样会把 60 分钟窗口吃满，同批轻量包顺延）。
+  - 诊断：`retention_reconcile()` 的分档同步，稳态预估按实际平均体积 × 实际份数算。
+- 磁盘预期：轻量 48 × ~14 MB ≈ 0.7 GB + 完整 12 × ~140 MB ≈ 1.7 GB，稳态约 2.4 GB。
+
+### 测试
+
+- 新增 `tests/test_sessions_in_full.py` **19 项**：完整快照（不带运行时）必须带会话、
+  轻量不带、显式 `include_sessions` 优先于配置、总开关关掉后一律不带、
+  会话包算"大包"、保留策略不把会话包挤进轻量配额、云端候选包含会话包。
+- 回归 14 组全绿（sessions_scope 13、quota 38、dedupe 55、lifecycle 53、cloud_window 58 等）。
+
+---
+
+## [1.6.4] - 2026-11-16
+
+继续收包体。拆开 1.6.3 的产物（48.11 MB 原始 / 19.67 MB 压缩）逐层看，还剩两块白占：
+
+### 变更
+
+- **去重阈值 256 KB → 4 KB**：256 KB 只挡住了"大块头"，包里还有 **483 个文件 / 10.11 MB**
+  是完全相同的小文件（`settings.yaml.bak` 系、`.zf-config-history` 快照、`_archive` 里的重复 md、
+  vendor 脚本副本……）。降到 4 KB 后单份快照去重命中 30 → 512 个；4 KB 以下仍直接复制
+  （清单条目成本会超过省下的体积）。安全性不变：只有 `(size, sha256)` 完全相同才省，
+  恢复路径一律先 `materialize_dedup()` 补齐副本。
+- **浏览器 profile 的缓存/历史不再进包**：P3 当时把 `douyin-browser/cli-profile/` 只加进了
+  **指纹**排除表，快照表漏了 —— 实测包里仍有 3.51 MB / 195 个文件的 Chromium profile。
+  整棵排除又不行（Cookies / Login Data / Local Storage 是同机可用的登录态），
+  于是只排"缓存 + 历史 + 预览图"，且**只在 `*-profile` 目录内生效**：
+  `ShaderCache/`、`CacheStorage/`、`Shared Dictionary/`、`Collections/`、`WebStorage/`、
+  `Nurturing/`、`Workspaces/`、`Sessions_Encrypted/`，以及 `History`、`Web Data`、`DIPS*`、
+  `Top Sites`、`Affiliation Database`、`Network Action Predictor`、`Edge Profile Picture.png`（1 MB，
+  已压缩目录里占体最大单项）。
+- 新增判定 `volatile_rules.is_snapshot_junk_in_browser_profile(rel, is_dir)`：
+  按路径段判断是否处在浏览器 profile 内，避免把别的插件里同名的 `History` 误伤。
+
+### 实测（同一份真实 `.dsh`）
+
+| 指标 | 1.6.3 | 1.6.4 |
+|---|---|---|
+| 快照原始体积 | 47.94 MB | **35.05 MB**（-26.9%） |
+| 压缩包体积 | 20.09 MB | **14.25 MB**（-29.1%） |
+| 去重命中 | 30 个 / 15.48 MB | **512 个 / 25.58 MB** |
+| 打包耗时 | 4.5 s | 4.6 s（小文件算 sha256 比整份复制便宜，没有变慢） |
+
+从最初 32.60 MB 起算，累计 **32.60 → 14.25 MB（-56.3%）**；原始 79.58 → 35.05 MB（-56.0%）。
+
+### 测试
+
+- `tests/test_snapshot_dedupe.py` 37 → **55 项**（新增 18）：4 KB 阈值生效但 400 B 文件仍两份都在、
+  清单指向正确、补齐内容一致；profile 里 ShaderCache/History/Web Data/DIPS/预览图/Nurturing 不进包，
+  Cookies / Login Data / Local State / Local Storage 保留，非 profile 目录下同名 `History` 不被误伤。
+
+---
+
+## [1.6.3] - 2026-11-16
+
+自检里剩下的 P5/P6/P7，一起收掉。
+
+### 修复
+
+- **P5 配置单一真相**：源码模式原来读源码树的 `zerofall_config.json`，而它比 dist 那份少 9 项
+  云窗口字段（`cloud_client_mode` / `cloud_window_*` / `cloud_outbox_*`），于是从源码调试时
+  窗口化悄悄失效、百度网盘退回常驻。现在 `default_config_path()` 在源码模式下**优先继承
+  dist 的现役配置**（`ZF_CONFIG_PATH` 环境变量可显式指定，打包运行仍是 exe 同目录），
+  两份文件也已同步为同一份内容。`selfcheck.py` 的 [9] 改为按"是否真的会被读到"出结论，
+  不再拿不会生效的差异报 WARN。
+- **P6 六处 `or <数字>`**：`ui/main_window.py` 四处时间戳读取改用新的 `_ts0()`
+  （`None`/空/非法统一转 `0.0`，不再用 `or 0` 吞值），`ui/tabs/settings_tab.py` 两处改用
+  `config_int()`。`selfcheck.py` 的 [1] 现在通过。
+- **P7 恢复脚本对账**：索引重建时被登记成"孤儿"的快照只写索引、不生成 `恢复_*.cmd`，
+  换台没装 ZeroFall 的机器就成了死数据（实测 `snapshot_20261115_142438` 缺脚本）。
+  启动清理现在在索引对账之后调 `write_restore_scripts()`（幂等，只补缺的），
+  并把补写数量写进启动清理日志。
+- **补 P4 的体积兜底缺陷**：验 1.6.2 时发现老索引条目没有 `runtime_included` 字段，
+  代码按"≥100 MB"猜运行时，而 P1/P3 之后真完整的包也只有 ~79 MB —— 真带运行时的
+  完整包会被当成"无运行时完整"，既不算进 `max_full_snapshots` 名额，云端也不会让它独占窗口。
+  新增 `backfill_runtime_included()`：启动清理对"标了完整且缺字段"的条目开包扫
+  `primary-runtime/`，把真实结论写回索引（幂等，包不在/坏包不猜，仍走体积兜底）。
+
+### 变更
+
+- `reconcile_with_disk()` 登记孤儿快照时同时判定 `runtime_included`：
+  包内有 `primary-runtime` 才算真完整，只有 `.zf_full` 标记的记为"无运行时完整"（P4 口径）。
+
+### 测试
+
+- 新增 `tests/test_config_and_restore_scripts.py` 14 项：配置路径四种情形（源码带/不带 dist、
+  `ZF_CONFIG_PATH`、打包）、本仓库实际读到的就是 dist 配置且云窗口字段齐全、
+  缺脚本补齐 / 幂等 / 缺失包不写 / 孤儿脚本清理不误删。
+- `tests/test_full_quota_semantics.py` 增加 7 项回填用例（31 → 38）：真带运行时的 79.6 MB 包
+  判 True、跳过运行时的判 False、轻量不写字段、包不在不瞎猜、重复调用幂等。
+- 回归：`retention_plan` 19、`cloud_*` 系列、`lifecycle_health` 53、`snapshot_dedupe` 37、
+  `full_quota_semantics` 31 等继续全绿。
+
+---
+
+## [1.6.2] - 2026-11-16
+
+这一版只做一件事：让"完整快照"的名额和它在盘上占的体积对上，并让含运行时的大包不再
+堵住云同步窗口。
+
+### 修复
+
+- **"完整快照"名不副实，挤爆配额**：`_full_snapshot_needs_runtime()` 在 DSH 运行时没变时
+  会跳过 `primary-runtime` 省盘，产物只有 20-80 MB，但索引照旧写 `is_full=True`，
+  于是它们全去挤 `max_full_snapshots` 那 12 个名额 —— 2026-11-16 实测盘上 21 份"完整"
+  里 19 份其实跟轻量包一样大，每天启动都报一次"完整快照超出配置 21/12"。
+  现在索引新增 `runtime_included`（创建时写死，权威），`snapshot_has_runtime()` 统一判据；
+  老索引没有该字段时按体积粗判（含运行时的包 165-242 MB，跳过的 20-80 MB，100 MB 为界），
+  体积也读不到就保守当成真完整。
+- **配额按实际内容分档**：`plan_retention()` 与 `get_overflow_snapshots()` 改成
+  「含运行时的完整快照」吃 `max_full`、「不含运行时的完整快照」并入轻量口径吃 `max_light`。
+  这样那些 20 MB 的"完整"不再占完整名额，溢出时走 `cloud_overflow_light_policy`
+  （默认直接删本地），也不会被当成完整包往云端塞。
+- **诊断报告的配额口径同步**：`retention_reconcile()` 拆成「完整（含运行时）」与
+  「轻量口径（轻量 + 无运行时完整）」，`disk` 里多出 `full_degraded` 计数，
+  只有真完整超出配置才升 WARNING。稳态预估也改成按"现在真有几份完整"算 ——
+  按 12 × 242 MB 满额估会把 1.9 GB 说成 4.4 GB（真实快照库实测）。
+
+### 变更
+
+- **含运行时的完整包独占一轮云同步**（新增配置 `cloud_full_runtime_keep`，默认 1）：
+  这类包 165-242 MB，一个就能把 60 分钟窗口吃满 —— 2026-11-16 07:41 实测窗口里
+  只推进了这一个包，同批轻量包全被挤到下一轮。现在云端只保留最新 N 份（默认 1），
+  传它那一轮让它独占，其余包顺延；更老的靠 `cloud_history_keep_days` 退休。
+
+### 实测
+
+- 换版前日志：08:09–08:13 三分钟连拍 3 份 79.58 MB；换版后 08:16 起基准指纹不再抖动，
+  首份静默快照 48.11 MB / 压缩 20.13 MB（去重清单 30 条）。
+- P4 生效点：`retention_reconcile` 在真实快照库上应把 21 份"完整"重算成
+  「完整（含运行时）1-2 份 + 轻量口径」，「完整快照超出配置」这条 WARNING 消失。
+
+### 测试
+
+- 新增 `tests/test_full_quota_semantics.py` 31 项：判据（新字段/老索引/体积未知/dict 探针）、
+  配额分档（真完整吃 max_full、无运行时吃 max_light、保护与边界）、
+  溢出分桶、云端只留最新 N 份、诊断口径与告警措辞。
+- 回归 10 组全绿：`retention_plan` 19、`retention_wiring` 9、`cloud_sampling` 22、
+  `cloud_snapshots` 32、`cloud_upload_policy` 10、`cloud_window` 58、`daily_full` 23、
+  `full_interval` 22、`lifecycle_health` 53、`snapshot_dedupe` 37。
+
+---
+
+## [1.6.1] - 2026-11-16
+
+### 修复
+
+- **静默快照退化成"雷打不动的 10 分钟一份"**：指纹把三个每分钟重写的心跳文件
+  （`nightly/relay-status.json`、`guardian/state/last-boot.json`、`dsh-windows-mcp.versions.json`）算成了
+  "环境被改"，于是 `_should_skip_unchanged_snapshot()` 永远命中不了"未变"。
+  2026-11-15 实测：430 次变更判定 / 143 份快照 / 约 4.6 GB 写入，插件其实一次没动过。
+  现在这三类心跳进 `MD5_EXCLUDE_FILES`，Chromium profile（`douyin-browser/cli-profile/`）与
+  心跳日志目录（`nightly/relay-logs/`）进按前缀排除，静默快照只在内容真变了时才拍。
+
+### 变更
+
+- **快照内容去重**：内容完全相同、且 ≥ 256 KB 的文件只存一份，另写 `_zf_dedup.json` 清单；
+  恢复时在解压后、拷贝到目标之前先把缺的副本补齐（`materialize_dedup()`），
+  后续 `_prune_extra_entries` / `_restore_dir_clean` 看到的仍是完整的树。
+  实测三份 `dsh-rea-plugin-9.9.9.tgz` 二进制相同（MD5 `D3A12DB579D8`，各 2,463,028 B）——
+  单这一项每份快照白背 7.05 MB。实测整机一次快照去重 30 个文件、省 15.48 MB。
+- **排除表统一**：新增 `modules/volatile_rules.py` 作为"哪些文件天然会变"的单一真相源，
+  指纹（`environment_checker`）与快照复制（`snapshot_manager`）共用，不再各排各的。
+  快照侧新排除：`*.pma`、`load_statistics.db*`、`SmartScreen/`、`BrowserMetrics/`、`Crashpad/`、
+  `relay-logs/`、轮转日志（`*.log.1`、`log.txt.1` 这类后缀不是 `.log` 的漏网之鱼）。
+  浏览器 `Default/`（含 Cookies）照旧保留。
+
+### 实测
+
+- 同一份 `.dsh`：原始体积 79.58 MB → 47.91 MB，压缩包 32.60 MB → **20.04 MB**（-38.5%）。
+  复制耗时 2.3 s、打包 1.4 s，仍在单份快照 5 秒量级内。
+
+### 测试
+
+- 相关 9 个用例全绿（约 250 项断言）：`cloud_snapshots` 32、`cloud_window` 58、
+  `lifecycle_health` 53、`plugin_drift` 22、`restore_scenarios`、`retention_plan` 19、
+  `runtime_dedup` 19、`silent_dedup` 10、`snapshot_dedupe` 37。
+
+---
+
 ## [1.6.0] - 2026-11-11  ·  [tag v1.6.0](https://github.com/laoyanyu66/zerofall/releases/tag/v1.6.0)
 
 这一天基本都在补"事故之后才会想到"的能力：把隔壁 DSH 生态里几套工具的核心思路

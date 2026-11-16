@@ -1,0 +1,7 @@
+{
+  "name": "dsh-resume-sessions",
+  "version": "1.0.0",
+  "description": "dsh 启动后自动恢复并续跑上次关闭前仍在运行的会话",
+  "author": "YG",
+  "license": "MIT"
+}

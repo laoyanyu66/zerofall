@@ -13,6 +13,11 @@ from config import ZeroFallConfig
 from logger import ZeroFallLogger
 from utils import calculate_md5, calculate_directory_md5, get_process_info
 
+try:                      # 源码运行：项目根在 sys.path 上
+    from modules import volatile_rules
+except Exception:         # pragma: no cover - 包内相对导入
+    from . import volatile_rules
+
 # MD5 校验时跳过的目录（运行时/缓存/依赖，体量巨大且不属于"插件环境"）
 # 不跳过会导致每次校验扫描 19000+ 文件，几十秒卡死 UI
 # 核心配置文件模式：这些文件被改动视为严重异常
@@ -47,9 +52,16 @@ MD5_EXCLUDE_DIRS = {
     'rea-engines', 'rea-jdk', 'tools', 'skills',
     # 会话数据天然持续变化（每次对话都会改），不适合做"篡改"比对
     'sessions',
+    # 会话工程缓存：每步对话都重写 sessions/<id>.json（2026-11-12 实测：
+    # 变更检测每分钟报一次"指纹变了"，元凶就是这里）
+    'session_projcache',
     # dsh-purge 插件的工作目录：last-cwd.txt 每切一次目录就重写，
     # installed-rev 每次装载都更新，同样属于运行时状态
     'dsh-purge',
+    # douyin-browser 的 Chromium 用户数据目录：Breadcrumbs/Crashpad/
+    # BrowserMetrics/Local State/Lockfile 等运行时文件每秒都在变，
+    # 205+ 个文件不排除会导致变更检测每 60 秒报一次"插件有改动"
+    'cli-profile',
 }
 
 # MD5 校验时跳过的文件（日志/运行时状态等易变文件，
@@ -78,7 +90,42 @@ MD5_EXCLUDE_FILES = [
     '*state.json',          # 插件状态，如 tiangong-state.json
     '*state.jsonl',
     '*.lock', '*.pid',
-]
+    # storages 根下的运行时状态：workspace.json 记录工作区列表，
+    # 每次切会话/开新会话都会重写（同样的每分钟抖动来源）
+    'workspace.json',
+    # resume-sessions 插件的状态文件：会话推进/恢复都会重写（实测 11:14 那次
+    # 指纹抖动就是它，靠 _log_drift_detail 的差异日志直接点出来的）
+    'resume-sessions.json',
+    # SQLite 的共享内存/回滚文件：进程开着就一直变（blue/blue.db-shm 实测 8 次/jam）
+    '*.db-shm', '*.db',
+    # ── 2026-11-16 自检：三个"每分钟心跳"文件 ──
+    # relay-status.json / last-boot.json / dsh-windows-mcp.versions.json 由插件自己
+    # 定时重写，没排掉之前"内容没变就跳过快照"永远命中不了：
+    # 实测 11-15 一天 430 次"有改动"、143 份快照、约 4.6 GB 写入，插件其实没动过。
+    # 明细见 modules/volatile_rules.py
+] + list(volatile_rules.FINGERPRINT_EXTRA_FILE_PATTERNS)
+
+# 按"相对路径前缀"排除（2026-11-12）
+#
+# 只按文件名/后缀排不掉这些：memory-tiers/log.txt 不匹配 *.log，
+# storages/memory/DL*.json 又是插件真正在写的数据。它们都在 .dsh 下，
+# 每轮对话都会动 —— 实测 4.5 小时里贡献了 31 + 25 次假"插件改动"，
+# 每次都触发一次静默快照（42 MB 目录 + 24.5 MB 压缩），纯属白干。
+#
+# 注意：只影响"指纹与 MD5 校验"，快照内容照样备份它们 —— 该存的数据一个字没少。
+MD5_EXCLUDE_REL_PREFIXES = (
+    'memory-tiers/',        # 插件运行日志与状态（log.txt / status.json）
+    'storages/memory/',     # 分层记忆 DL0-DL2：每轮对话都重写
+    'storages/session_projcache/',
+    'blue/',                # 插件的 sqlite（含 -shm/-wal）
+    # 2026-11-16：心跳日志与 Chromium profile 整棵子树（详见 volatile_rules.py）
+) + tuple(volatile_rules.FINGERPRINT_EXTRA_REL_PREFIXES)
+
+
+def _is_excluded_rel(rel: str) -> bool:
+    """相对路径是否命中"按前缀排除"的运行时目录"""
+    r = str(rel or '').replace('\\', '/').lstrip('./')
+    return any(r.startswith(p) for p in MD5_EXCLUDE_REL_PREFIXES)
 
 class CheckResult(Enum):
     """校验结果枚举"""
@@ -176,10 +223,18 @@ class EnvironmentChecker:
                     # 就地裁剪：不进入被排除的目录（省掉整棵子树的遍历）
                     dirnames[:] = [d for d in dirnames
                                    if d.lower() not in MD5_EXCLUDE_DIRS]
+                    rel_dir = str(Path(dirpath).relative_to(root)).replace('\\', '/')
+                    if rel_dir == '.':
+                        rel_dir = ''
+                    if rel_dir and _is_excluded_rel(rel_dir + '/'):
+                        dirnames[:] = []
+                        continue
                     for fn in sorted(filenames):
                         low = fn.lower()
                         if any(fnmatch.fnmatch(low, pat.lower())
                                for pat in MD5_EXCLUDE_FILES):
+                            continue
+                        if rel_dir and _is_excluded_rel(rel_dir + '/' + fn):
                             continue
                         fp = Path(dirpath) / fn
                         try:
@@ -191,6 +246,11 @@ class EnvironmentChecker:
                             key, rel, int(st.st_mtime), st.st_size))
             except Exception as e:
                 parts.append('{}:error:{}'.format(key, e))
+
+        # 把这次参与哈希的明细留在实例上：变更检测说"指纹变了"之后，
+        # 上层可以直接和上一份明细做差集，把"到底哪个文件变了"写进日志。
+        # 不做成返回值是为了不打扰现有的 quick_fingerprint() 调用方（2026-11-12）。
+        self.last_parts = parts
 
         if not parts:
             return ''
@@ -220,6 +280,8 @@ class EnvironmentChecker:
                 parts = str(rel).replace('\\', '/').split('/')
                 if any(p.lower() in MD5_EXCLUDE_DIRS for p in parts[:-1]):
                     return True
+                if _is_excluded_rel(str(rel)):
+                    return True
                 fn = parts[-1].lower()
                 if any(_fn.fnmatch(fn, pat.lower()) for pat in MD5_EXCLUDE_FILES):
                     return True
@@ -232,12 +294,14 @@ class EnvironmentChecker:
         plugins_dir = Path(self.config.deepseek_plugins_dir)
         if plugins_dir.exists():
             baseline['plugins'] = calculate_directory_md5(str(plugins_dir), exclude_dirs=MD5_EXCLUDE_DIRS,
-                                      exclude_files=MD5_EXCLUDE_FILES)
+                                      exclude_files=MD5_EXCLUDE_FILES,
+                                      exclude_rel_prefixes=MD5_EXCLUDE_REL_PREFIXES)
         
         config_dir = Path(self.config.deepseek_config_dir)
         if config_dir.exists():
             baseline['config'] = calculate_directory_md5(str(config_dir), exclude_dirs=MD5_EXCLUDE_DIRS,
-                                      exclude_files=MD5_EXCLUDE_FILES)
+                                      exclude_files=MD5_EXCLUDE_FILES,
+                                      exclude_rel_prefixes=MD5_EXCLUDE_REL_PREFIXES)
         
         self._state['baseline_md5'] = baseline
         self._save_state()
@@ -262,7 +326,8 @@ class EnvironmentChecker:
         plugins_dir = Path(self.config.deepseek_plugins_dir)
         if plugins_dir.exists() and 'plugins' in baseline:
             current_md5 = calculate_directory_md5(str(plugins_dir), exclude_dirs=MD5_EXCLUDE_DIRS,
-                                      exclude_files=MD5_EXCLUDE_FILES)
+                                      exclude_files=MD5_EXCLUDE_FILES,
+                                      exclude_rel_prefixes=MD5_EXCLUDE_REL_PREFIXES)
             baseline_md5 = baseline['plugins']
             
             for file_path, baseline_hash in baseline_md5.items():
@@ -280,7 +345,8 @@ class EnvironmentChecker:
         config_dir = Path(self.config.deepseek_config_dir)
         if config_dir.exists() and 'config' in baseline:
             current_md5 = calculate_directory_md5(str(config_dir), exclude_dirs=MD5_EXCLUDE_DIRS,
-                                      exclude_files=MD5_EXCLUDE_FILES)
+                                      exclude_files=MD5_EXCLUDE_FILES,
+                                      exclude_rel_prefixes=MD5_EXCLUDE_REL_PREFIXES)
             baseline_md5 = baseline['config']
             
             for file_path, baseline_hash in baseline_md5.items():
@@ -344,7 +410,8 @@ class EnvironmentChecker:
         plugins_dir = Path(self.config.deepseek_plugins_dir)
         if plugins_dir.exists() and 'plugins' in baseline:
             current_md5 = calculate_directory_md5(str(plugins_dir), exclude_dirs=MD5_EXCLUDE_DIRS,
-                                      exclude_files=MD5_EXCLUDE_FILES)
+                                      exclude_files=MD5_EXCLUDE_FILES,
+                                      exclude_rel_prefixes=MD5_EXCLUDE_REL_PREFIXES)
             baseline_md5 = baseline['plugins']
             
             for file_path, baseline_hash in baseline_md5.items():
@@ -511,7 +578,8 @@ class EnvironmentChecker:
                 _out = __import__("subprocess").run(
                     ["powershell", "-NoProfile", "-Command",
                      "Get-CimInstance Win32_PageFileSetting | ForEach-Object { $_.Name + '|' + $_.InitialSize + '|' + $_.MaximumSize }"],
-                    capture_output=True, text=True, timeout=8).stdout or ""
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=(0x08000000 if _os.name == "nt" else 0)).stdout or ""
                 for _line in _out.splitlines():
                     _parts = _line.strip().split("|")
                     if len(_parts) >= 3 and _parts[0] and not _os.path.exists(_parts[0]):

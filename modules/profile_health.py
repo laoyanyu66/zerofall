@@ -44,8 +44,72 @@ def _profile_dir(home: Path, profile: str) -> Path:
 def _host_ai_base(host_base: Optional[Path]) -> Optional[Path]:
     if host_base:
         return Path(host_base)
-    cand = Path(r"D:\DeepSeek\resources\app\dsh\node_modules\@deepseek-ai")
-    return cand if cand.is_dir() else None
+    # 2026-11-12：DSH 0.2.2 起把内核打进 resources\app.asar，`resources\app\dsh\...`
+    # 这条老路径不再存在，而 asar 内部的路径 Path.exists() 恒为 False（它不是真目录）。
+    # 所以这里只把它当成"可能存在的 hint"，真正的判定交给 _builtin_provided()。
+    for cand in (Path(r"D:\DeepSeek\resources\app\dsh\node_modules\@deepseek-ai"),
+                 Path(r"D:\DeepSeek\resources\app\node_modules\@deepseek-ai")):
+        if cand.is_dir():
+            return cand
+    return None
+
+
+# 宿主安装根的候选位置。判定"内建 @deepseek-ai 包在不在"用它，
+# 不复用 @deepseek-ai 目录本身——asar 包里的路径探不到。
+_INSTALL_ROOT_HINTS = (
+    r"D:\DeepSeek",
+    r"C:\Program Files\DeepSeek",
+    r"C:\Program Files\DeepSeek Harness",
+)
+_HOST_LAYOUT_DIRS = ("app", "app.asar", "app.asar.unpacked", "default_app.asar")
+
+
+def _host_install_root(exe_hint: str = "") -> Optional[Path]:
+    """找到 DSH 安装根（含 resources 的那一层）。找不到返回 None。"""
+    cands: List[Path] = []
+    if exe_hint:
+        p = Path(exe_hint)
+        cands.append(p.parent if p.suffix else p)
+    env = os.environ.get("DSH_INSTALL_ROOT") or ""
+    if env:
+        cands.append(Path(env))
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        cands.append(Path(local) / "Programs" / "DeepSeek")
+    cands.extend(Path(p) for p in _INSTALL_ROOT_HINTS)
+    for root in cands:
+        try:
+            res = root / "resources"
+            if any((res / n).exists() for n in _HOST_LAYOUT_DIRS):
+                return root
+        except OSError:
+            continue
+    return None
+
+
+def _builtin_provided(host_base: Optional[Path], short: str) -> bool:
+    """内建 bundle（@deepseek-ai/*）是否由宿主提供。
+
+    语义：内建包是宿主自己的内核，装法随版本变（旧版散落在 resources\\app\\dsh\\
+    node_modules，新版打进 app.asar）。所以判据是"宿主装在哪、它的内核目录在不在"，
+    而不是"profile 的 node_modules 里有没有这个目录"——后者在新版下永远为假，
+    会把 dsh-base / dsh-web-app 误判成"声明的包丢了"，
+    进而让 neutralize_bundles() 把内核从 bundles 里摘掉（那才是真事故）。
+    """
+    base = _host_ai_base(host_base)
+    if base is not None and (base / short).exists():
+        return True
+    if host_base is not None and (Path(host_base) / short).exists():
+        return True
+    resp = _host_install_root()
+    if resp is None:
+        return False
+    res = resp / "resources"
+    # 老布局：app\dsh\node_modules\@deepseek-ai\<short>
+    if (res / "app" / "dsh" / "node_modules" / "@deepseek-ai" / short).exists():
+        return True
+    # 新布局：内核整包在 app.asar（Path 探不进去），只看布局文件在不在
+    return any((res / n).exists() for n in ("app.asar", "app.asar.unpacked", "app"))
 
 
 # ──────────────────────────────────────────────────────────────── 1. manifest
@@ -96,9 +160,8 @@ def check_bundles(pdir: Path, bundles: List[str],
         local = nm / name
         present = local.exists() or local.is_symlink()
         if not present and name.startswith(_BUILTIN_BUNDLE_PREFIX):
-            base = _host_ai_base(host_base)
             short = name.split("/", 1)[1] if "/" in name else name
-            present = bool(base and (base / short).exists())
+            present = _builtin_provided(host_base, short)
         (ok if present else missing).append(name)
     if missing:
         return _result("bundles", "bundle 可解析性", "error",
@@ -182,28 +245,63 @@ def _is_link(p: Path) -> bool:
         return False
 
 
+def _dep_source_dir(pdir: Path, spec: str) -> Optional[Path]:
+    """file:./vendor/x → 解析出源目录（不存在就 None）"""
+    if not str(spec).startswith(("file:", "link:")):
+        return None
+    rel = str(spec).split(":", 1)[1].strip().lstrip("/\\")
+    if not rel:
+        return None
+    src = (pdir / rel)
+    try:
+        src = src.resolve()
+    except OSError:
+        pass
+    return src if src.is_dir() else None
+
+
+def _copy_is_current(copy_dir: Path, src_dir: Path) -> bool:
+    """实体副本与源是否同一份内容（用 manifest 指纹判，不逐字节比）"""
+    a, b = copy_dir / "package.json", src_dir / "package.json"
+    try:
+        if a.is_file() and b.is_file():
+            return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+    return False
+
+
 def check_file_links(pdir: Path, deps: Dict[str, str]) -> Dict[str, Any]:
     nm = pdir / "node_modules"
     local = {k: v for k, v in deps.items() if str(v).startswith(("file:", "link:"))}
     if not local:
         return _result("links", "file:/link: 联接", "ok", "没有本地路径依赖")
-    broken, materialized, ok = [], [], []
-    for name in local:
+    broken, stale, current, ok = [], [], [], []
+    for name, spec in local.items():
         target = nm / name
         if not target.exists() and not target.is_symlink():
             broken.append(name)
-        elif _is_link(target):
+            continue
+        if _is_link(target):
             ok.append(name)
-        else:
-            materialized.append(name)
+            continue
+        # pnpm 有时把联接落成实体副本。是不是问题取决于**副本还跟不跟得上源**：
+        # 跟得上就只是"改源码不即时生效"（不影响运行，降成提示）；
+        # 跟不上说明这份副本是旧的——那才是真问题，DSH 加载的是旧代码。
+        src = _dep_source_dir(pdir, spec)
+        (current if (src is not None and _copy_is_current(target, src)) else stale).append(name)
     if broken:
         return _result("links", "file:/link: 联接", "error",
                        "node_modules 里没有这些链接（改源码不会生效，启动时也可能解析失败）：" + "、".join(broken),
                        "pnpm install 重新建立联接")
-    if materialized:
+    if stale:
         return _result("links", "file:/link: 联接", "warn",
-                       "联接被换成了实体副本（pnpm 的已知行为）：" + "、".join(materialized),
-                       "删掉这几个目录后重新 pnpm install，才能恢复'改源码即时生效'")
+                       "实体副本落后于源（DSH 加载的是旧代码）：" + "、".join(stale),
+                       "删掉这几个目录后重新 pnpm install，让联接指回 vendor")
+    if current:
+        return _result("links", "file:/link: 联接", "info",
+                       "已落成实体副本但与源一致（pnpm 行为，不影响运行）：" + "、".join(current),
+                       "想让'改源码即时生效'就重装成链接；只跑起来不需要动")
     return _result("links", "file:/link: 联接", "ok", f"{len(ok)} 个本地依赖都是链接")
 
 
@@ -220,32 +318,44 @@ def check_patch(pdir: Path) -> Dict[str, Any]:
     except Exception as e:
         return _result("patch", "profile patch", "error", f"YAML 解析失败：{e}",
                        "修 YAML；ZeroFall 的配置编辑页会在写入前校验")
-    ids = {str(e.get("id")) for e in entries if e.get("id")}
-    dangling, dup_in_block = [], []
+    # insert 的语义是「在这个上下文里**新建**一个挂载」，子项 id 本来就不该预先存在 ——
+    # 顶层没有 id 的 `- insert:` 块就是往根上下文装新插件（例如 dsh-resume-sessions）。
+    # 所以「子项 id 不在顶层 ids 里」是正常形态，不是缺陷。
+    # 真正的缺陷只有两种，都会让 DSH 挂载失败或行为不确定：
+    #   1. 子项 id 与本文件其它顶层条目 id 相撞 → 两个插件抢同一个 id
+    #   2. 同一个 insert 块内重复出现同一个 id
+    top_ids = {str(e.get("id")) for e in entries if e.get("id")}
+    collisions, dup_in_block = set(), set()
     for e in entries:
         ins = e.get("insert")
-        if isinstance(ins, list):
-            for item in ins:
-                if not isinstance(item, dict):
-                    continue
-                iid = str(item.get("id") or "")
-                if iid and iid not in ids:
-                    dangling.append(iid)
-                seen = set()
-                for sub in ins:
-                    if isinstance(sub, dict) and str(sub.get("id")) == iid:
-                        if iid in seen:
-                            dup_in_block.append(iid)
-                        seen.add(iid)
-    if dangling:
-        return _result("patch", "profile patch", "warn",
-                       "insert: 里引用了不存在的 id：" + "、".join(sorted(set(dangling))),
-                       "删掉这些 insert 项，或补上对应条目")
+        if not isinstance(ins, list):
+            continue
+        seen = set()
+        for item in ins:
+            if not isinstance(item, dict):
+                continue
+            iid = str(item.get("id") or "")
+            if not iid:
+                continue
+            if iid in top_ids:
+                collisions.add(iid)
+            if iid in seen:
+                dup_in_block.add(iid)
+            seen.add(iid)
+    # 两类缺陷一次报全：分开早退会让"撞车 + 块内重复"同时存在时只看到第一个，
+    # 修完再跑一次才看见第二个 —— 对非技术用户是白跑一趟。
+    problems = []
+    if collisions:
+        problems.append("新建 id 与顶层条目撞车：" + "、".join(sorted(collisions)))
     if dup_in_block:
-        return _result("patch", "profile patch", "warn",
-                       "同一 insert 块内重复挂载：" + "、".join(sorted(set(dup_in_block))),
-                       "块内去重（顶层重复是 DSH 的合法覆盖机制，不算问题）")
-    return _result("patch", "profile patch", "ok", f"{len(entries)} 条，无悬空 insert / 块内重复")
+        problems.append("同一 insert 块内重复：" + "、".join(sorted(dup_in_block)))
+    if problems:
+        return _result("patch", "profile patch", "warn", "insert: " + "；".join(problems),
+                       "撞车：改掉其中一边的 id；块内重复：块内去重。"
+                       "顶层重复 id 是 DSH 的合法覆盖机制，不用动")
+    new_mounts = sum(1 for e in entries if isinstance(e.get("insert"), list))
+    return _result("patch", "profile patch", "ok",
+                   f"{len(entries)} 条，无 id 撞车 / 块内重复（其中 {new_mounts} 个 insert 块为新增挂载）")
 
 
 # ──────────────────────────────────────────────────────────────── 汇总
@@ -312,14 +422,13 @@ def unresolvable_bundles(home: Path, profile: str = "desktop",
     pdir = _profile_dir(home, profile)
     info = read_profile(pdir)
     nm = pdir / "node_modules"
-    base = _host_ai_base(host_base)
     out = []
     for name in info["bundles"]:
         local = nm / name
         present = local.exists() or local.is_symlink()
         if not present and name.startswith(_BUILTIN_BUNDLE_PREFIX):
             short = name.split("/", 1)[1] if "/" in name else name
-            present = bool(base and (base / short).exists())
+            present = _builtin_provided(host_base, short)
         if not present:
             out.append(name)
     return out

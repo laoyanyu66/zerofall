@@ -232,7 +232,28 @@ class ZeroFallLogger:
         """记录前置校验开始"""
         cls.info("前置启动校验开始")
     
+    # 前置校验每分钟跑一次（UI 定时刷新），状态稳定时不该每分钟刷一行
+    _pre_launch_state = {'status': None, 'at': 0.0}
+
     @classmethod
     def pre_launch_check_completed(cls, status: str):
-        """记录前置校验完成"""
-        cls.info(f"前置启动校验完成 | 状态: {status}")
+        """记录前置校验完成
+
+        节流（2026-11-12）：实测一天 259 行「前置启动校验完成 | 状态: passed」，
+        99% 是同一状态在刷屏。改成"状态变了"或"距上次满 30 分钟"才写 INFO，
+        其余降到 DEBUG —— 排查时照样能翻到，正常日子日志干净得多。
+        """
+        try:
+            import time as _t
+            now = _t.time()
+            state = cls._pre_launch_state
+            changed = state.get('status') != status
+            stale = (now - float(state.get('at') or 0)) >= 1800
+            if changed or stale:
+                state['status'] = status
+                state['at'] = now
+                cls.info(f"前置启动校验完成 | 状态: {status}")
+            else:
+                cls.debug(f"前置启动校验完成 | 状态: {status}（未变化，30 分钟内不重复记）")
+        except Exception:
+            cls.info(f"前置启动校验完成 | 状态: {status}")

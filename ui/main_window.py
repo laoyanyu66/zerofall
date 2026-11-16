@@ -10,8 +10,9 @@ import ctypes.wintypes
 import time
 import json
 import shutil
+import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, List
 
 from PyQt6.QtWidgets import (
@@ -53,6 +54,22 @@ MOD_SHIFT = 0x0004
 VK_Z = 0x5A
 
 
+def _ts0(value) -> float:
+    """把"时间戳字段"转 float，None / 空 / 非法一律当 0.0
+
+    P6（2026-11-16）：`float(getattr(self, '_x', 0) or 0)` 这种写法会被
+    selfcheck 的 or-num 检查点名 —— 虽然这里 0 与 None 同义，但项目里
+    已因 `or <数字>` 吞过合法的 0，统一改走这个函数，读起来也没有歧义。
+
+    放成模块级函数（而不是类里的静态方法）是有原因的：`tests/test_cloud_window.py`
+    会把选定的方法绑到自己的 Host 桩对象上跑，桩对象上没有本类的方法表。
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class ZeroFallMainWindow(QMainWindow):
     """ZeroFall主窗口"""
     
@@ -69,9 +86,14 @@ class ZeroFallMainWindow(QMainWindow):
             from modules import diagnostics as _diag
             _rec = _diag.retention_reconcile(self.config)
             if _rec.get("notes"):
-                ZeroFallLogger.warning("[保留策略] {} | 盘上 {} 份 / {:.2f} GB，稳态预计 {:.2f} GB".format(
+                _msg = "[保留策略] {} | 盘上 {} 份 / {:.2f} GB，稳态预计 {:.2f} GB".format(
                     "；".join(_rec["notes"]), _rec["disk"]["total"],
-                    _rec["disk"]["size_gb"], _rec.get("steady_state_gb", 0)))
+                    _rec["disk"]["size_gb"], _rec.get("steady_state_gb", 0))
+                # 只有真超了（宽松档 2 倍）才值得 WARNING；到上限本身是设计内状态
+                if _rec.get("severity") == "warning":
+                    ZeroFallLogger.warning(_msg)
+                else:
+                    ZeroFallLogger.info(_msg)
             else:
                 ZeroFallLogger.info("[保留策略] 配置与盘面一致：{} 份 / {:.2f} GB，稳态预计 {:.2f} GB".format(
                     _rec.get("disk", {}).get("total", 0),
@@ -121,8 +143,33 @@ class ZeroFallMainWindow(QMainWindow):
         self._init_tray()
         self._apply_autostart_setting()
         self._start_status_timer()
-        
+
+        # 启动后静默自愈「会话续跑」插件：重装 / 重建 profile / 被改成 enabled:false
+        # 都是"等 DSH 起来才发现没恢复"的典型原因，这里提前补回来（幂等，不改不写）。
+        try:
+            QTimer.singleShot(4000, self._auto_heal_resume_plugin)
+        except Exception:
+            pass
+
         ZeroFallLogger.info("ZeroFall主界面初始化完成")
+
+    def _auto_heal_resume_plugin(self):
+        """后台静默自愈插件（不弹窗、不阻塞 UI）。"""
+        def _work():
+            try:
+                from modules import resume_guard as rg
+                rep = rg.ensure_plugin(rg.resolve_home(self.config), "desktop", host_llm=None)
+                actions = rep.get("actions") or []
+                errors = rep.get("errors") or []
+                if actions:
+                    ZeroFallLogger.info("[会话续跑] 启动自愈：" + "；".join(str(a) for a in actions))
+                if errors:
+                    ZeroFallLogger.warning("[会话续跑] 启动自愈未完成：" + "；".join(errors))
+            except Exception as exc:      # noqa: BLE001
+                ZeroFallLogger.warning("[会话续跑] 启动自愈异常: {}".format(exc))
+
+        import threading as _th_heal
+        _th_heal.Thread(target=_work, daemon=True, name="ZeroFall-ResumeHeal").start()
     
     def showEvent(self, event):
         """窗口首次显示"""
@@ -211,6 +258,15 @@ class ZeroFallMainWindow(QMainWindow):
         except Exception as _e:
             self.config_tab = None
             ZeroFallLogger.warning("[配置编辑] 页签初始化失败: {}".format(_e))
+
+        # 会话续跑标签页：崩溃/重启后把「关闭前在跑」的会话接上（自愈插件 + 看快照 + 补跑）
+        try:
+            from ui.tabs.resume_tab import ResumeTab
+            self.resume_tab = ResumeTab(self.config, self.snapshot_manager)
+            self.tab_widget.addTab(self._scrollable(self.resume_tab, 620), "会话续跑")
+        except Exception as _e:
+            self.resume_tab = None
+            ZeroFallLogger.warning("[会话续跑] 页签初始化失败: {}".format(_e))
 
         # 环境校验标签页
         self.env_tab = EnvTab(self.config, self.env_checker)
@@ -390,6 +446,7 @@ class ZeroFallMainWindow(QMainWindow):
         """Dashboard 快速快照（无需输入备注）"""
         snapshot = self.snapshot_manager.create_snapshot(notes="快速快照")
         if snapshot:
+            self._refresh_snapshot_tab()
             self._refresh_dashboard()
             QMessageBox.information(
                 self, "快速快照",
@@ -556,7 +613,7 @@ class ZeroFallMainWindow(QMainWindow):
         brand.setObjectName('brand')
         row.addWidget(brand)
 
-        ver = QLabel("v1.6.0")
+        ver = QLabel("v1.6.6")
         ver.setObjectName('mute')
         row.addWidget(ver)
 
@@ -834,9 +891,96 @@ class ZeroFallMainWindow(QMainWindow):
         
         # 云端同步（同步盘方案）
         self._start_cloud_sync_timer()
+        # 本地更新通道（standalone 也能自换版）
+        self._start_self_update_timer()
         # DSH 崩溃日志监控（覆盖"UI 弹窗但进程存活"的场景）
         self._start_crash_log_monitor()
     
+    # ── 本地更新通道（standalone 也能自换版）────────────────
+    def _self_update_dir(self) -> Path:
+        raw = str(getattr(self.config, 'self_update_dir', '') or '').strip()
+        if raw:
+            return Path(raw)
+        if getattr(sys, 'frozen', False):
+            return Path(sys.executable).parent / 'updates'
+        return Path(__file__).resolve().parent.parent / 'updates'
+
+    def _start_self_update_timer(self):
+        self._self_update_busy = False
+        if not getattr(self.config, 'self_update_enabled', True):
+            ZeroFallLogger.info("[自更新] 本地更新通道已关闭")
+            return
+        minutes = max(5, self._cfg_int('self_update_interval_minutes', 30))
+        try:
+            self._self_update_timer = QTimer(self)
+            self._self_update_timer.setInterval(minutes * 60 * 1000)
+            self._self_update_timer.timeout.connect(self._self_update_tick)
+            self._self_update_timer.start()
+            ZeroFallLogger.info("[自更新] 每 {} 分钟扫一次 {}".format(
+                minutes, self._self_update_dir()))
+            QTimer.singleShot(90 * 1000, self._self_update_tick)
+        except Exception as e:
+            ZeroFallLogger.warning("[自更新] 定时器启动失败: {}".format(e))
+
+    def _self_update_tick(self):
+        """扫更新目录：有新包且条件满足 → 换版并重启"""
+        if getattr(self, '_self_update_busy', False):
+            return
+        self._self_update_busy = True
+        import threading as _th_su
+
+        def _work():
+            try:
+                if not getattr(sys, 'frozen', False):
+                    return                      # 源码模式不做自替换
+                if getattr(self.config, 'self_update_require_idle', True):
+                    idle = self._cloud_system_idle_seconds()
+                    need = max(0, self._cfg_int('self_update_idle_minutes', 3)) * 60
+                    if idle < need:
+                        # 静默跳过让人完全看不出"为什么没更新"，这里补一行日志
+                        try:
+                            from modules.self_update import find_new_package
+                            if find_new_package(self._self_update_dir(), sys.executable):
+                                ZeroFallLogger.info(
+                                    "[自更新] 有可用新包，但键鼠只空闲 {:.0f} 分钟（需 {} 分钟），下一轮再看".format(
+                                        idle / 60, int(need // 60)))
+                        except Exception:
+                            pass
+                        return                      # 人还在用，下一轮再看
+                from modules.self_update import find_new_package, mark_applied
+                hit = find_new_package(self._self_update_dir(), sys.executable)
+                if not hit:
+                    return
+                pkg, manifest = hit
+                from modules.updater import apply_update
+                ok, msg = apply_update(str(pkg),
+                                       install_dir=Path(sys.executable).parent,
+                                       restart=True)
+                if not ok:
+                    ZeroFallLogger.warning("[自更新] 应用失败: {}".format(msg))
+                    return
+                mark_applied(self._self_update_dir(), pkg, manifest)
+                ZeroFallLogger.info("[自更新] 已安排换版 v{}（{}）：{}".format(
+                    (manifest or {}).get('version', '?'), pkg.name, msg))
+                if '下次启动生效' in str(msg):
+                    # 没安排成自动重启 → 别关程序，换版留给下次启动
+                    return
+                QTimer.singleShot(0, self._quit_for_update)
+            except Exception as e:
+                ZeroFallLogger.warning("[自更新] 检查失败: {}".format(e))
+            finally:
+                self._self_update_busy = False
+
+        _th_su.Thread(target=_work, daemon=True, name="ZeroFall-SelfUpdate").start()
+
+    def _quit_for_update(self):
+        """退出主进程，把 exe 让给替换脚本（脚本自己会重启）"""
+        try:
+            ZeroFallLogger.info("[自更新] 主进程退出，替换脚本 4 秒后覆盖 exe 并重启")
+        except Exception:
+            pass
+        QApplication.quit()
+
     def _start_crash_log_monitor(self):
         """监控 DSH 崩溃日志，检测 UI 层崩溃（进程未退出也能发现）"""
         try:
@@ -936,6 +1080,9 @@ class ZeroFallMainWindow(QMainWindow):
                     if exe.exists():
                         subprocess.Popen([str(exe)], close_fds=True,
                                          creationflags=0x00000008)   # DETACHED_PROCESS
+                        # 只有"由 ZeroFall 拉起的"才允许在窗口结束时关掉，
+                        # 用户自己开的客户端一律不碰
+                        self._cloud_client_launched_by_us = True
                         ZeroFallLogger.info("[云同步] 已自动启动百度网盘客户端: {}".format(exe))
                         return True
                 except Exception:
@@ -961,37 +1108,26 @@ class ZeroFallMainWindow(QMainWindow):
                 return
             
             interval_min = max(5, int(getattr(self.config, 'cloud_sync_interval_minutes', 60)))
-            self._cloud_timer = QTimer(self)
-            self._cloud_timer.timeout.connect(self._sync_latest_to_cloud)
-            self._cloud_timer.start(interval_min * 60000)
-            
+            self._cloud_client_warned = False
+            mode = self._cloud_client_mode()
+
             ZeroFallLogger.info(
                 "[云同步] 已启用，目标 {}，间隔 {} 分钟，历史保留 {} 天".format(
                     sync_dir, interval_min,
                     getattr(self.config, 'cloud_history_keep_days', 14)
                 )
             )
-            
-            # 启动时检查网盘客户端（同步盘上传依赖它运行）
-            if not self._ensure_baidu_client(auto_start=True):
-                ZeroFallLogger.warning(
-                    "[云同步] 百度网盘客户端未运行且无法自动启动，"
-                    "快照只会保存在本地同步盘目录，不会上传云端"
-                )
-                self._cloud_client_warned = True
-            
-            # 启动 30 秒后先同步一次
-            QTimer.singleShot(30000, self._sync_latest_to_cloud)
-            # 启动 60 秒后执行「次日开机云端收敛」：把昨天的云快照收敛成 1 轻量 + 1 完整
-            QTimer.singleShot(60000, self._consolidate_cloud_daily)
-            # 启动 90 秒后处理一次本地溢出（把超限的旧快照归档到云）
-            QTimer.singleShot(90000, self._handle_overflow_to_cloud)
 
-            # 上面三个原来都是 singleShot，只在启动时跑一次。后果是：启动之后
-            # 新产生的快照永远不会被判定为"溢出"，本地会一直堆。实测跑了一上午，
-            # 完整快照从 12 涨到 15、轻量堆到 68，全都没归档。
-            #
-            # 溢出归档必须是周期性的 —— 它负责把超限快照搬到云端再删本地，
+            # 最新快照同步：只保留一条定时器。
+            # 2026-11-13：原来 _cloud_timer 和 _cloud_sync_timer 两条同频定时器都连着
+            # _sync_latest_to_cloud，一小时跑两遍；日志里同一个包出现两行"已加密同步"，
+            # 两个线程同时写同一个 .enc（配合每小时漂移的抽样，一天塞进 91 个包）。
+            self._cloud_sync_timer = QTimer(self)
+            self._cloud_sync_timer.setInterval(interval_min * 60 * 1000)
+            self._cloud_sync_timer.timeout.connect(self._sync_latest_to_cloud)
+            self._cloud_sync_timer.start()
+
+            # 溢出归档必须是周期性的 —— 它负责把超限快照搬走再删本地，
             # 是本地磁盘的唯一出口。
             self._overflow_timer = QTimer(self)
             self._overflow_timer.setInterval(
@@ -999,15 +1135,623 @@ class ZeroFallMainWindow(QMainWindow):
             self._overflow_timer.timeout.connect(self._handle_overflow_to_cloud)
             self._overflow_timer.start()
 
-            # 最新快照同步也做成周期，否则只有开机那一刻的会进同步盘
-            self._cloud_sync_timer = QTimer(self)
-            self._cloud_sync_timer.setInterval(
-                max(1, self._cfg_int('cloud_sync_interval_minutes', 60)) * 60 * 1000)
-            self._cloud_sync_timer.timeout.connect(self._sync_latest_to_cloud)
-            self._cloud_sync_timer.start()
+            # 窗口看门狗：每分钟判一次窗口边界
+            #   进入窗口 → 唤醒网盘客户端 + 清空 outbox + 跑一轮同步
+            #   离开窗口 → 静置后关掉本轮由 ZeroFall 拉起的客户端
+            self._cloud_window_timer = QTimer(self)
+            self._cloud_window_timer.setInterval(60 * 1000)
+            self._cloud_window_timer.timeout.connect(self._cloud_window_tick)
+            self._cloud_window_timer.start()
+
+            if mode == 'windowed':
+                self._cloud_app_started_ts = time.time()
+                self._cloud_window_state = False
+                self._cloud_close_attempts = 0
+                self._cloud_catchup_at = 0
+                self._load_window_state()
+                if self._cloud_window_trigger() == 'fixed':
+                    _start_s = str(getattr(self.config, 'cloud_window_start', '03:30') or '03:30')
+                    _span = self._cfg_int('cloud_window_minutes', 60)
+                    _auto_close = bool(getattr(self.config, 'cloud_window_auto_close', True))
+                    ZeroFallLogger.info(
+                        "[云窗口] 定点模式：每天 {} 起连续 {} 分钟才写同步盘；窗口外只暂存本地，"
+                        "客户端{}".format(_start_s, _span,
+                                          "窗口结束后自动关闭" if _auto_close else "由用户自行关闭"))
+                else:
+                    ZeroFallLogger.info(
+                        "[云窗口] 机会模式：开机后 {} 分钟、键鼠空闲 {} 分钟、且有包要传时才开一轮；"
+                        "两次窗口至少隔 {} 小时，{} 小时没传过就硬来一次".format(
+                            self._cfg_int('cloud_window_start_delay_minutes', 5),
+                            self._cfg_int('cloud_window_idle_minutes', 5),
+                            self._cfg_int('cloud_window_gap_hours', 20),
+                            self._cfg_int('cloud_window_force_hours', 36)))
+                self._cloud_window_tick()
+            else:
+                # always / manual：保持老行为，启动时确认客户端在不在
+                if not self._ensure_baidu_client(auto_start=(mode == 'always')):
+                    ZeroFallLogger.warning(
+                        "[云同步] 百度网盘客户端未运行且无法自动启动，"
+                        "快照只会保存在本地同步盘目录，不会上传云端")
+                    self._cloud_client_warned = True
+                # 启动 30 秒后先同步一次
+                QTimer.singleShot(30000, self._sync_latest_to_cloud)
+
+            # 启动 60 秒后执行「次日开机云端收敛」：把昨天的云快照收敛成 1 轻量 + 1 完整
+            QTimer.singleShot(60000, self._consolidate_cloud_daily)
+            # 启动 90 秒后处理一次本地溢出（把超限的旧快照归档到云/暂存区）
+            QTimer.singleShot(90000, self._handle_overflow_to_cloud)
         except Exception as e:
             ZeroFallLogger.error("[云同步] 初始化失败: {}".format(e))
-    
+
+    # ════════════════════════════════════════════════════════════════
+    #  云端同步窗口（2026-11-13）
+    #  为什么要有窗口：同步盘方案的成本不在"写文件"，而在百度网盘客户端
+    #  必须一直在线才能把文件传上去。实测 12 个 BaiduNetdisk* 进程占 1.99 GB，
+    #  空闲内存被压到 11.9%。把写入集中到每天一段窗口，客户端就只需要在那段
+    #  时间在线，其余时间可以完全不跑。
+    # ════════════════════════════════════════════════════════════════
+
+    def _cloud_client_mode(self) -> str:
+        mode = str(getattr(self.config, 'cloud_client_mode', 'windowed') or 'windowed').lower()
+        return mode if mode in ('windowed', 'always', 'manual') else 'windowed'
+
+    def _cloud_window_trigger(self) -> str:
+        """窗口时机：auto（看机会开窗，默认）/ fixed（定点）"""
+        raw = str(getattr(self.config, 'cloud_window_trigger', 'auto') or 'auto').lower()
+        return raw if raw in ('auto', 'fixed') else 'auto'
+
+    def _cloud_window_state_path(self) -> Path:
+        base = Path(getattr(self.config, 'snapshot_dir', '') or '.')
+        return base / '.cloud_window_state.json'
+
+    def _load_window_state(self):
+        """读上次窗口结束时间（跨重启有效）——决定这一轮要不要等、隔多久"""
+        self._cloud_last_window_end_ts = 0.0
+        try:
+            p = self._cloud_window_state_path()
+            if p.is_file():
+                raw = json.loads(p.read_text(encoding='utf-8'))
+                self._cloud_last_window_end_ts = float(raw.get('last_window_end') or 0)
+        except Exception as _e:
+            ZeroFallLogger.debug("[云窗口] 读窗口状态失败: {}".format(_e))
+
+    def _save_window_state(self, start: float = 0) -> None:
+        try:
+            p = self._cloud_window_state_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(
+                {'last_window_end': getattr(self, '_cloud_last_window_end_ts', 0.0),
+                 'last_window_start': start or 0},
+                ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as _e:
+            ZeroFallLogger.debug("[云窗口] 写窗口状态失败: {}".format(_e))
+
+    def _cloud_system_idle_seconds(self) -> int:
+        """键鼠空闲秒数。取不到就当"很空闲"——宁可少开客户端，也不让功能卡死"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _LII(ctypes.Structure):
+                _fields_ = [('cbSize', wintypes.UINT), ('dwTime', wintypes.DWORD)]
+
+            lii = _LII()
+            lii.cbSize = ctypes.sizeof(_LII)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                return 1 << 30
+            k32 = ctypes.windll.kernel32
+            k32.GetTickCount64.restype = ctypes.c_uint64
+            delta = int(k32.GetTickCount64()) - int(lii.dwTime)
+            if delta < 0:  # GetTickCount64 拿到了 32 位值
+                delta += 1 << 32
+            return max(0, delta // 1000)
+        except Exception:
+            return 1 << 30
+
+    def _cloud_cadence_days(self) -> int:
+        """同步频率（天）。0 = 不按频率，走 gap_hours"""
+        try:
+            n = self._cfg_int('cloud_sync_cadence_days', 1)
+        except Exception:
+            n = 1
+        return max(0, min(30, n))
+
+    def _cloud_window_gap_seconds(self) -> float:
+        days = self._cloud_cadence_days()
+        if days > 0:
+            return days * 24 * 3600.0
+        return max(0, self._cfg_int('cloud_window_gap_hours', 20)) * 3600.0
+
+    def _cloud_outbox_limit(self) -> int:
+        """暂存区上限：频率越长放得越多（每天 2 个包，再多给点余量）"""
+        base = max(1, self._cfg_int('cloud_outbox_max', 6))
+        days = self._cloud_cadence_days()
+        if days > 1:
+            return max(base, days * 2 + 2)
+        return base
+
+    def _cloud_window_pkg_limit(self) -> int:
+        """一个窗口最多搬几个包：频率长的时候要够搬完积压"""
+        base = self._cfg_int('cloud_window_max_packages', 8)
+        if base <= 0:
+            base = 8
+        days = self._cloud_cadence_days()
+        if days > 1:
+            return max(base, days * 2 + 2)
+        return base
+
+    def _compact_outbox(self) -> int:
+        """暂存区按天去重：同一天同类（轻量/完整）只留最新的一个
+
+        频率改成"每 3 天 / 7 天"之后，每小时往里塞一个会把暂存区撑爆；
+        而恢复点只需要"每天 1 轻 + 1 完整"，跟云端收敛同一套规则。
+        频率 = 每天（或 0）时不去重：那时候暂存区本来就只攒十几小时，多几个包不碍事。
+        """
+        if self._cloud_cadence_days() <= 1:
+            return 0
+        try:
+            d = self._cloud_outbox_path()
+            if not d.is_dir():
+                return 0
+            keep = {}
+            drop = []
+            for f in sorted(d.glob('snapshot_*.zip*'), key=lambda p: p.name):
+                if f.name.endswith('.json'):
+                    continue
+                parts = f.name.replace('.enc', '').replace('.zip', '').split('_')
+                if len(parts) < 2:
+                    continue
+                day = parts[1]
+                base = f.name[:-4] if f.name.endswith('.enc') else f.name
+                meta = d / (base + '.meta.json')
+                is_full = None
+                if meta.is_file():
+                    try:
+                        raw = json.loads(meta.read_text(encoding='utf-8'))
+                        if 'is_full' in raw:
+                            is_full = bool(raw.get('is_full'))
+                    except Exception:
+                        is_full = None
+                if is_full is None:
+                    try:
+                        is_full = f.stat().st_size > 100 * 1024 * 1024
+                    except Exception:
+                        is_full = False
+                key = (day, is_full)
+                if key in keep:
+                    drop.append(keep[key])
+                keep[key] = f
+            removed = 0
+            for f in drop:
+                base = f.name[:-4] if f.name.endswith('.enc') else f.name
+                meta = d / (base + '.meta.json')
+                try:
+                    f.unlink()
+                    removed += 1
+                except Exception:
+                    continue
+                try:
+                    if meta.is_file():
+                        meta.unlink()
+                except Exception:
+                    pass
+            if removed:
+                ZeroFallLogger.info(
+                    "[云窗口] 暂存区按天去重：删掉 {} 个同日冗余包".format(removed))
+            return removed
+        except Exception as e:
+            ZeroFallLogger.warning("[云窗口] 暂存区去重失败: {}".format(e))
+            return 0
+
+    def _cloud_has_backlog(self) -> bool:
+        """有东西要传吗：暂存区有包，或者今天还一个都没传过"""
+        try:
+            if (bool(getattr(self.config, 'cloud_outbox_enabled', True))
+                    and self._cloud_outbox_count() > 0):
+                return True
+        except Exception:
+            pass
+        return self._cloud_uploads_today() == 0
+
+    def _cloud_should_open_window(self, now_ts=None) -> bool:
+        """机会模式：现在适合开一轮窗口吗"""
+        now_ts = now_ts or time.time()
+        delay = max(0, self._cfg_int('cloud_window_start_delay_minutes', 5)) * 60
+        started = getattr(self, '_cloud_app_started_ts', now_ts)
+        if now_ts - started < delay:
+            return False
+        if not self._cloud_has_backlog():
+            return False
+        # 今天额度已经用完：开窗只会白拉起一次客户端，等明天
+        if self._cloud_budget_left() == 0:
+            return False
+
+        gap = self._cloud_window_gap_seconds()
+        force = max(gap + 12 * 3600,
+                    self._cfg_int('cloud_window_force_hours', 36) * 3600)
+        last = max(_ts0(getattr(self, '_cloud_last_window_end_ts', 0)),
+                   _ts0(getattr(self, '_cloud_window_started_ts', 0)))
+        since_last = now_ts - last
+
+        # 1) 饿太久：不管空闲，先传掉，免得包一直攒着
+        if since_last >= force:
+            ZeroFallLogger.info("[云窗口] 距上次窗口已 {:.0f} 小时，无视空闲直接开窗".format(
+                since_last / 3600))
+            return True
+        # 2) 暂存区压满：优先搬走，但一小时最多补一次
+        try:
+            full = (self._cloud_outbox_count() >= self._cloud_outbox_limit())
+        except Exception:
+            full = False
+        if full and since_last >= 3600:
+            ZeroFallLogger.info("[云窗口] 暂存区已压满，立即开窗搬走")
+            return True
+        # 3) 常态：隔够 gap 小时，且人确实不在
+        if since_last < gap:
+            return False
+        idle = self._cloud_system_idle_seconds()
+        return idle >= max(0, self._cfg_int('cloud_window_idle_minutes', 5)) * 60
+
+    def _cloud_window_bounds(self, now=None):
+        """算出「当前这一轮」窗口的 (开始, 结束, 是否在窗口内)
+
+        窗口按天重复，允许跨午夜（23:40 起 60 分钟 = 到次日 00:40）。
+        不在窗口内时返回的是"下一个将要开始的窗口"，方便日志里点名。
+        """
+        now = now or datetime.now()
+        raw = str(getattr(self.config, 'cloud_window_start', '03:30') or '03:30').strip()
+        try:
+            hh, mm = [int(x) for x in raw.replace('：', ':').split(':')[:2]]
+        except Exception:
+            hh, mm = 3, 30
+        span = max(1, self._cfg_int('cloud_window_minutes', 60))
+        anchor = now.replace(hour=hh % 24, minute=mm % 60, second=0, microsecond=0)
+        for start in (anchor - timedelta(days=1), anchor, anchor + timedelta(days=1)):
+            end = start + timedelta(minutes=span)
+            if start <= now < end:
+                return start, end, True
+        nxt = anchor if now < anchor else anchor + timedelta(days=1)
+        return nxt, nxt + timedelta(minutes=span), False
+
+    def _cloud_in_window(self, now=None) -> bool:
+        """当前是否允许往同步盘写文件（非 windowed 模式恒为 True）"""
+        if self._cloud_client_mode() != 'windowed':
+            return True
+        try:
+            if self._cloud_window_trigger() == 'fixed':
+                return bool(self._cloud_window_bounds(now)[2])
+            # 机会模式没有"日历窗口"，只有"这一轮窗口开着没有"
+            return bool(getattr(self, '_cloud_window_state', False))
+        except Exception:
+            return True
+
+    def _cloud_outbox_path(self) -> Path:
+        """窗口外的本地暂存区"""
+        raw = str(getattr(self.config, 'cloud_outbox_dir', '') or '').strip()
+        if raw:
+            return Path(raw)
+        base = Path(getattr(self.config, 'snapshot_dir', '') or '.')
+        return base / '_cloud_outbox'
+
+    def _cloud_outbox_count(self) -> int:
+        """暂存区里压了几个待上传的包"""
+        try:
+            d = self._cloud_outbox_path()
+            if not d.is_dir():
+                return 0
+            return sum(1 for f in d.glob('snapshot_*.zip*') if not f.name.endswith('.json'))
+        except Exception:
+            return 0
+
+    def _cloud_budget_left(self) -> int:
+        """今天还能往云端塞几个包；-1 = 不限
+
+        两处上传路径（最新快照抽样 / 溢出归档）共用这一个闸门。
+        改前只有溢出路径查上限，抽样路径完全不查 —— 实测上限 24、实际当天 91。
+        """
+        cap = self._cfg_int('cloud_upload_max_per_day', 24)
+        days = self._cloud_cadence_days()
+        if days > 1:
+            # 一周攒下的包要在同一个窗口里搬完，日上限不能按"每天"卡死
+            cap = max(cap, days * 2 + 2)
+        if cap <= 0:
+            return -1
+        done = self._cloud_uploads_today() + self._cloud_outbox_count()
+        return max(0, cap - done)
+
+    def _flush_outbox_to_cloud(self) -> int:
+        """把窗口外暂存的包搬进同步盘（只在窗口内调用）"""
+        if not getattr(self.config, 'cloud_outbox_enabled', True):
+            return 0
+        try:
+            outbox = self._cloud_outbox_path()
+            if outbox.is_dir():
+                self._compact_outbox()
+            if not outbox.is_dir():
+                return 0
+            sync_dir = Path(getattr(self.config, 'cloud_sync_dir', '') or '')
+            if not sync_dir:
+                return 0
+            sync_dir.mkdir(parents=True, exist_ok=True)
+
+            limit = self._cloud_window_pkg_limit()
+            if limit <= 0:
+                limit = 8
+            budget = self._cloud_budget_left()
+            if budget == 0:
+                ZeroFallLogger.info(
+                    "[云窗口] 今日上传已达上限，暂存区 {} 个包留到明天".format(
+                        self._cloud_outbox_count()))
+                return 0
+            if budget > 0:
+                limit = min(limit, budget)
+
+            pkgs = [f for f in outbox.glob('snapshot_*.zip*')
+                    if not f.name.endswith('.json')]
+            pkgs.sort(key=lambda p: p.name)
+            moved = 0
+            for src in pkgs:
+                if moved >= limit:
+                    break
+                dst = sync_dir / src.name
+                try:
+                    # meta 的文件名跟同步盘一致：snapshot_xxx.zip.meta.json
+                    # （_sync_one_snapshot 写的是 zip 基名，不是 .zip.enc.meta.json）
+                    _base = src.name[:-4] if src.name.endswith('.enc') else src.name
+                    meta_src = outbox / (_base + '.meta.json')
+                    meta_dst = sync_dir / (_base + '.meta.json')
+
+                    if dst.exists() and dst.stat().st_size == src.stat().st_size:
+                        # 已经搬过：只清暂存副本，不占本次窗口配额
+                        src.unlink()
+                        if meta_src.exists() and meta_dst.exists():
+                            meta_src.unlink()
+                        continue
+                    shutil.copy2(str(src), str(dst))
+                    if dst.stat().st_size != src.stat().st_size:
+                        ZeroFallLogger.error(
+                            "[云窗口] 拷贝校验失败，保留暂存副本: {}".format(src.name))
+                        continue
+                    src.unlink()
+                    if meta_src.exists():
+                        try:
+                            shutil.copy2(str(meta_src), str(meta_dst))
+                            meta_src.unlink()
+                        except Exception:
+                            pass
+                    moved += 1
+                    self._cloud_last_write_at = time.time()
+                except Exception as e:
+                    ZeroFallLogger.warning(
+                        "[云窗口] 搬移 {} 失败: {}".format(src.name, e))
+            if moved:
+                ZeroFallLogger.info(
+                    "[云窗口] 已把 {} 个暂存包搬进同步盘（剩余 {} 个等下次窗口）".format(
+                        moved, self._cloud_outbox_count()))
+            return moved
+        except Exception as e:
+            ZeroFallLogger.error("[云窗口] 清暂存区失败: {}".format(e))
+            return 0
+
+    def _cloud_window_tick(self):
+        """窗口看门狗（每分钟）：机会模式按条件开关窗口；定点模式按时间边界"""
+        if not getattr(self.config, 'cloud_sync_enabled', False):
+            return
+        if self._cloud_client_mode() != 'windowed':
+            return
+        try:
+            if self._cloud_window_trigger() == 'fixed':
+                self._cloud_window_tick_fixed()
+            else:
+                self._cloud_window_tick_auto()
+        except Exception as e:
+            ZeroFallLogger.warning("[云窗口] 检查失败: {}".format(e))
+
+    def _cloud_window_begin(self, why: str = ''):
+        """开一轮窗口：先看今天还有没有额度，没额度就别把网盘拉起来"""
+        # 2026-11-14 修：原来是无条件 ensure_baidu_client → flush，于是一天额度用完以后
+        # 只要暂存区一满就"开窗 → 拉起网盘 → 发现没额度 → 跳过上传"，客户端白开一整天。
+        if self._cloud_budget_left() == 0:
+            ZeroFallLogger.info(
+                "[云窗口] 今天已传 {} 个（上限 {}），不开窗、也不拉起网盘客户端；"
+                "暂存 {} 个留到明天".format(
+                    self._cloud_uploads_today(),
+                    self._cfg_int('cloud_upload_max_per_day', 24),
+                    self._cloud_outbox_count()))
+            self._cloud_window_state = False
+            return
+        self._cloud_window_state = True
+        self._cloud_window_started_ts = time.time()
+        self._cloud_client_launched_by_us = False
+        self._cloud_close_attempts = 0
+        self._save_window_state(start=self._cloud_window_started_ts)
+        ZeroFallLogger.info(
+            "[云窗口] 开窗（{}）：空闲 {:.0f} 分钟，暂存 {} 个，今天已传 {} 个".format(
+                why or '条件满足', self._cloud_system_idle_seconds() / 60,
+                self._cloud_outbox_count(), self._cloud_uploads_today()))
+        if not self._ensure_baidu_client(auto_start=True):
+            ZeroFallLogger.warning(
+                "[云窗口] 网盘客户端没起来，本轮只把包搬进同步盘，等它上线后自动补传")
+        self._flush_outbox_to_cloud()
+        try:
+            self._consolidate_cloud_daily()
+        except Exception as e:
+            ZeroFallLogger.warning("[云窗口] 收敛失败: {}".format(e))
+        self._sync_latest_to_cloud()
+
+    def _cloud_window_end(self, why: str = ''):
+        self._cloud_window_state = False
+        self._cloud_last_window_end_ts = time.time()
+        self._save_window_state()
+        ZeroFallLogger.info("[云窗口] 收窗（{}），{} 个包留在暂存区等下次".format(
+            why or '条件结束', self._cloud_outbox_count()))
+
+    def _cloud_catchup_if_full(self):
+        """补窗口：暂存区压满就搬一次（3 小时内只补一次），防止包一直攒着"""
+        try:
+            if not bool(getattr(self.config, 'cloud_outbox_enabled', True)):
+                return
+            n = self._cloud_outbox_count()
+            if n < self._cloud_outbox_limit():
+                return
+            if (time.time() - getattr(self, '_cloud_catchup_at', 0)) <= 3 * 3600:
+                return
+            if self._cloud_budget_left() == 0:
+                return
+            self._cloud_catchup_at = time.time()
+            ZeroFallLogger.info(
+                "[云窗口] 暂存区已压满（{} 个），立即补一次同步（可能错过了窗口）".format(n))
+            if not self._ensure_baidu_client(auto_start=True):
+                ZeroFallLogger.warning("[云窗口] 补窗口时网盘客户端没起来，包继续留在暂存区")
+            self._flush_outbox_to_cloud()
+        except Exception as e:
+            ZeroFallLogger.warning("[云窗口] 补窗口失败: {}".format(e))
+
+    def _cloud_window_tick_auto(self):
+        """机会模式看门狗"""
+        now_ts = time.time()
+        span = max(1, self._cfg_int('cloud_window_minutes', 60)) * 60
+        settle = max(0, self._cfg_int('cloud_window_settle_minutes', 8)) * 60
+
+        # 频率拉长后暂存区会长，先按天去重，避免每小时一个包把盘撑满
+        self._compact_outbox()
+
+        if getattr(self, '_cloud_window_state', None) is True:
+            started = float(getattr(self, '_cloud_window_started_ts', now_ts) or now_ts)
+            elapsed = now_ts - started
+            # 额度已经用完 → 这个窗口干不了活，立刻收窗关客户端（别让网盘白挂一小时）
+            if self._cloud_budget_left() == 0:
+                self._cloud_window_end("今日额度已用完，不必干等")
+                if bool(getattr(self.config, 'cloud_window_auto_close', True)):
+                    self._maybe_close_baidu_client()
+                return
+            if elapsed >= span:
+                self._cloud_window_end("到点（{} 分钟）".format(int(span // 60)))
+                if bool(getattr(self.config, 'cloud_window_auto_close', True)):
+                    self._maybe_close_baidu_client()
+                return
+            # 队列清空 + 静置够久 → 不用干等满 60 分钟（人回来用电脑时客户端能早点退场）
+            busy = bool(getattr(self, '_archive_busy', False)
+                        or getattr(self, '_cloud_sync_busy', False))
+            last_write = _ts0(getattr(self, '_cloud_last_write_at', 0))
+            if (self._cloud_outbox_count() == 0 and not busy
+                    and (now_ts - last_write) >= settle and elapsed >= 60):
+                self._cloud_window_end("队列已清空，提前收尾")
+                if bool(getattr(self.config, 'cloud_window_auto_close', True)):
+                    self._maybe_close_baidu_client()
+            return
+
+        if self._cloud_should_open_window(now_ts):
+            self._cloud_window_begin("机会满足")
+            return
+
+        self._cloud_catchup_if_full()
+        if bool(getattr(self.config, 'cloud_window_auto_close', True)):
+            self._maybe_close_baidu_client()
+
+    def _cloud_window_tick_fixed(self):
+        """定点模式看门狗（老行为）"""
+        try:
+            start, end, is_open = self._cloud_window_bounds()
+        except Exception:
+            return
+
+        state = getattr(self, '_cloud_window_state', None)
+        if is_open:
+            if state is not True:
+                self._cloud_window_state = True
+                self._cloud_client_launched_by_us = False
+                self._cloud_close_attempts = 0
+                ZeroFallLogger.info(
+                    "[云窗口] 进入同步窗口 {}-{}，唤醒百度网盘并清空暂存区".format(
+                        start.strftime('%H:%M'), end.strftime('%H:%M')))
+                if not self._ensure_baidu_client(auto_start=True):
+                    ZeroFallLogger.warning(
+                        "[云窗口] 网盘客户端没起来，本轮只把包搬进同步盘，等它上线后自动补传")
+                self._flush_outbox_to_cloud()
+                try:
+                    self._consolidate_cloud_daily()
+                except Exception as e:
+                    ZeroFallLogger.warning("[云窗口] 收敛失败: {}".format(e))
+                self._sync_latest_to_cloud()
+            return
+
+        if state is True:
+            self._cloud_window_state = False
+            ZeroFallLogger.info(
+                "[云窗口] 窗口结束，{} 个包留在暂存区等下次窗口".format(
+                    self._cloud_outbox_count()))
+
+        # 补窗口：定点窗口可能整天都跑不到（机器关着/睡眠），暂存区压满就立刻补一次
+        self._cloud_catchup_if_full()
+
+        if bool(getattr(self.config, 'cloud_window_auto_close', True)):
+            self._maybe_close_baidu_client()
+
+    def _baidu_client_running(self) -> bool:
+        """只看客户端在不在，不负责拉起（给"能不能安全删同步盘文件"用）"""
+        try:
+            import psutil
+            for p in psutil.process_iter(['name']):
+                try:
+                    if 'baidunetdisk' in (p.info.get('name') or '').lower():
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    def _maybe_close_baidu_client(self):
+        """窗口结束且静置够久后关掉网盘客户端，把 1.9 GB 常驻内存还回去
+
+        只关「本轮窗口由 ZeroFall 自己拉起来的那个」：用户自己打开网盘下载东西时，
+        ZeroFall 绝不碰。
+        """
+        try:
+            if not getattr(self, '_cloud_client_launched_by_us', False):
+                return
+            if getattr(self, '_archive_busy', False) or getattr(self, '_cloud_sync_busy', False):
+                return
+            settle = max(0, self._cfg_int('cloud_window_settle_minutes', 8))
+            last = _ts0(getattr(self, '_cloud_last_write_at', 0))
+            if last and (time.time() - last) < settle * 60:
+                return
+
+            import psutil
+            alive = any(((p.info.get('name') or '').lower()) == 'baidunetdisk.exe'
+                        for p in psutil.process_iter(['name']))
+            if not alive:
+                self._cloud_client_launched_by_us = False
+                self._cloud_close_attempts = 0
+                return
+
+            attempts = getattr(self, '_cloud_close_attempts', 0) + 1
+            self._cloud_close_attempts = attempts
+            force = attempts >= 3
+            import subprocess
+            # 先不带 /F：给客户端一个 WM_CLOSE 的机会，把上传队列落盘；
+            # 连续两次没反应才强杀（正常情况第一次就退了）。
+            cmd = ['taskkill', '/IM', 'BaiduNetdisk.exe']
+            if force:
+                cmd.append('/F')
+            subprocess.run(cmd, capture_output=True, timeout=20,
+                           creationflags=0x08000000)
+            if force:
+                subprocess.run(['taskkill', '/IM', 'BaiduNetdiskUnite.exe', '/F'],
+                               capture_output=True, timeout=20,
+                               creationflags=0x08000000)
+            if attempts == 1:
+                ZeroFallLogger.info(
+                    "[云窗口] 已请求关闭百度网盘客户端（静置 {} 分钟后动作），下一分钟复查".format(
+                        settle))
+            self._cloud_client_launched_by_us = (not force)
+            if force:
+                self._cloud_close_attempts = 0
+                ZeroFallLogger.info("[云窗口] 网盘客户端未响应普通关闭，已强制结束")
+        except Exception as e:
+            ZeroFallLogger.warning("[云窗口] 关闭网盘客户端失败: {}".format(e))
+
     def _sync_latest_to_cloud(self):
         """把最新健康快照复制到同步盘（百度网盘客户端会自动上传）"""
         # 顺手清掉孤儿 .meta.json：删快照时如果先删了 zip 后崩、或者云端
@@ -1026,7 +1770,31 @@ class ZeroFallMainWindow(QMainWindow):
             if not sync_dir or not sync_dir.parent.exists():
                 return
             sync_dir.mkdir(parents=True, exist_ok=True)
-            
+
+            # 窗口模式：窗口外一律不写同步盘。
+            # 这时客户端多半没开，写进去只会让它下次启动时一次面对一堆待传文件 ——
+            # 内存峰值正是这么上去的（10 个 BaiduNetdiskUnite 并发哈希上传）。
+            if not self._cloud_in_window():
+                ZeroFallLogger.debug(
+                    "[云同步] 窗口模式：当前不在同步窗口内，跳过同步盘写入")
+                return
+            if getattr(self, '_cloud_sync_busy', False):
+                ZeroFallLogger.info("[云同步] 上一轮写入还没结束，跳过本轮")
+                return
+
+            # 两条上传路径共用的每日闸门。
+            # 改前只有「溢出归档」查 cloud_upload_max_per_day，抽样这条完全不查 ——
+            # 配置写 24，实测当天写了 91 个包。
+            budget = self._cloud_budget_left()
+            if budget == 0:
+                ZeroFallLogger.info(
+                    "[云同步] 今日上传已达上限 {} 个，本轮跳过".format(
+                        self._cfg_int('cloud_upload_max_per_day', 24)))
+                return
+            round_cap = self._cfg_int('cloud_upload_per_cycle', 2) or 2
+            if budget > 0:
+                round_cap = min(round_cap, budget)
+
             # 先确认客户端在运行，否则本次同步只是"本地复制"，不会真正上云
             client_ok = self._ensure_baidu_client(auto_start=True)
             if not client_ok:
@@ -1043,59 +1811,96 @@ class ZeroFallMainWindow(QMainWindow):
                         "但需要打开百度网盘客户端才会真正上传到云端。\n"
                         "客户端启动后会自动补传。".format(sync_dir)
                     ))
-            
+
             healthy = self.snapshot_manager.get_healthy_snapshots()
             if not healthy:
                 ZeroFallLogger.info("[云同步] 暂无健康快照，跳过")
                 return
-            
+
             encrypt = bool(getattr(self.config, 'cloud_sync_encrypt', False))
-            
-            # === 1. 同步最新轻量快照（每小时，快）===
+
+            pending = []
+
+            # === 1. 轻量快照 ===
             # 注：不再在此清理云端快照。新策略下云端是"归档库"，
-            # 清理统一由「溢出归档」和「次日开机收敛」负责，否则会误删归档。
+            # 清理统一由「溢出归档」和「次日收敛 / 下午窗口」负责，否则会误删归档。
             light = [s for s in healthy if not getattr(s, 'is_full', False)]
             if light:
-                # 本地轻量 5 分钟一个，全传上去既慢又占网盘。
-                # 按步长抽样：每 N 个取 1 个（默认 12 → 每小时 1 个）。
-                # 抽样是确定性的（按当天时间序号），不会重复传同一个。
+                # 本地轻量 5-10 分钟一个，全传上去既慢又占网盘，按步长抽样。
                 pick = self._pick_sampled_snapshots(light, 'cloud_sync_light_stride', 12)
                 for _snap in pick:
-                    dst = sync_dir / ((Path(_snap.archive_path).name + ".enc")
-                                      if encrypt else Path(_snap.archive_path).name)
+                    _src = Path(getattr(_snap, 'archive_path', ''))
+                    dst = sync_dir / ((_src.name + ".enc") if encrypt else _src.name)
                     if dst.exists() and dst.stat().st_size > 0:
                         continue        # 已传过，跳过
-                    import threading as _th_sync
-                    _th_sync.Thread(
-                        target=lambda s=_snap: self._sync_one_snapshot(s, sync_dir, encrypt),
-                        daemon=True, name="ZeroFall-CloudLight").start()
-            
-            # === 2. 同步完整快照（只传一次，后台线程避免卡 UI）===
+                    pending.append(_snap)
+
+            # === 2. 完整快照 ===
             full_snaps = [s for s in healthy if getattr(s, 'is_full', False)]
             # 完整快照同样抽样：本地 30 分钟一个，每 4 个传 1 个（≈2 小时）。
             # 全传的话一天就是 16 个 × 300 MB ≈ 4.8 GB，网盘和带宽都吃不消。
             full_snaps = self._pick_sampled_snapshots(full_snaps, 'cloud_sync_full_stride', 4)
-            pending_full = []
-            for s in full_snaps:
+            try:
+                from modules.snapshot_manager import (
+                    snapshot_is_full_grade as _is_heavy,
+                    pick_runtime_full_for_cloud as _pick_heavy,
+                )
+            except Exception:                     # pragma: no cover
+                _is_heavy = lambda _s: bool(getattr(_s, 'is_full', False))
+                _pick_heavy = lambda _snaps, _k=1: list(_snaps)[-1:]
+
+            # 既不含运行时、也不带会话的"完整快照"（20-80 MB）跟轻量包一个量级，
+            # 照旧抽样传
+            for s in [x for x in full_snaps if not _is_heavy(x)]:
                 src = Path(s.archive_path)
                 if not src.exists():
                     continue
                 dst = sync_dir / ((src.name + ".enc") if encrypt else src.name)
                 if not (dst.exists() and dst.stat().st_size > 0):
-                    pending_full.append(s)
-            
-            if pending_full:
+                    pending.append(s)
+
+            # 大包（含运行时 165-434 MB / 带会话 ~140 MB）单独处理（2026-11-16 / P4）：
+            #   · 云端只留最新 cloud_full_runtime_keep 份，更老的靠 14 天规则退休；
+            #   · 传它那一轮让它独占 —— 一个 242 MB 包会把 60 分钟窗口整个吃满，
+            #     跟它同批的轻量包全被挤掉（07:41 实测，窗口里只推进了这一个包）。
+            heavy = _pick_heavy(full_snaps, self._cfg_int('cloud_full_runtime_keep', 1))
+            pending_heavy = []
+            for s in heavy:
+                src = Path(s.archive_path)
+                if not src.exists():
+                    continue
+                dst = sync_dir / ((src.name + ".enc") if encrypt else src.name)
+                if not (dst.exists() and dst.stat().st_size > 0):
+                    pending_heavy.append(s)
+
+            if pending_heavy:
+                try:
+                    mb = Path(pending_heavy[0].archive_path).stat().st_size / (1024 * 1024)
+                except Exception:
+                    mb = float(getattr(pending_heavy[0], 'size_mb', 0))
                 ZeroFallLogger.info(
-                    "[云同步] 发现 {} 个未同步的完整快照，将在后台加密上传".format(len(pending_full))
-                )
-                import threading
-                t = threading.Thread(
+                    "[云同步] 本轮单独传大包 {}（{:.1f} MB），它独占这一轮；"
+                    "另外 {} 个包顺延到下一轮".format(
+                        pending_heavy[0].snapshot_id, mb, len(pending)))
+                pending = pending_heavy[:1]
+            elif pending:
+                if len(pending) > round_cap:
+                    ZeroFallLogger.info(
+                        "[云同步] 本轮待传 {} 个，按每轮上限只传 {} 个（其余下一轮）".format(
+                            len(pending), round_cap))
+                    pending = pending[:round_cap]
+
+            if pending:
+                ZeroFallLogger.info(
+                    "[云同步] 发现 {} 个未同步快照，将在后台加密上传".format(len(pending)))
+                # 一个后台线程串行写：原来每个轻量快照单独起一个线程，
+                # 叠加重复定时器后同一个 .enc 会被两个线程同时写。
+                threading.Thread(
                     target=self._sync_full_snapshots_bg,
-                    args=(pending_full, sync_dir, encrypt),
-                    daemon=True
-                )
-                t.start()
-            
+                    args=(pending, sync_dir, encrypt),
+                    daemon=True, name="ZeroFall-Cloud"
+                ).start()
+
             # 加密模式下，清理历史遗留的明文快照（避免隐私泄露）
             if encrypt:
                 for plain in sync_dir.glob("snapshot_*.zip"):
@@ -1234,16 +2039,21 @@ class ZeroFallMainWindow(QMainWindow):
             return False
     
     def _sync_full_snapshots_bg(self, snapshots, sync_dir: Path, encrypt: bool):
-        """后台线程：同步完整快照（420 MB 级，耗时较长）
-        
-        注：不在此清理云端，避免误删归档；清理由次日开机收敛负责。
+        """后台线程：串行同步一批快照（加密 30 MB 级，耗时较长）
+
+        注：不在此清理云端，避免误删归档；清理由次日收敛负责。
+        _cloud_sync_busy 让下一轮（定时器 / 窗口）知道"还在写"，避免叠加。
         """
+        self._cloud_sync_busy = True
         try:
             for s in snapshots:
-                ZeroFallLogger.info("[云同步] 后台处理完整快照: {}".format(s.snapshot_id))
-                self._sync_one_snapshot(s, sync_dir, encrypt)
+                ZeroFallLogger.info("[云同步] 后台处理快照: {}".format(s.snapshot_id))
+                if self._sync_one_snapshot(s, sync_dir, encrypt):
+                    self._cloud_last_write_at = time.time()
         except Exception as e:
-            ZeroFallLogger.error("[云同步] 完整快照后台同步失败: {}".format(e))
+            ZeroFallLogger.error("[云同步] 后台同步失败: {}".format(e))
+        finally:
+            self._cloud_sync_busy = False
     
     # 注：原 _cleanup_cloud（按"保留 N 个"清理云端）已废弃。
     # 云端现在是归档库，清理统一由「溢出归档」和「次日开机收敛」负责，
@@ -1322,9 +2132,24 @@ class ZeroFallMainWindow(QMainWindow):
                 # 坏包不删会被反复扫到，孤儿好包则要登记后才会被正常回收）
                 dirs = self.snapshot_manager.cleanup_staging_dirs()
                 bad = self.snapshot_manager.cleanup_corrupt_archives()
+                # 恢复脚本是 per-snapshot 生成的，快照删了脚本不会自己走
+                # （实测攒了 525 个指向已删 zip 的死脚本）
+                try:
+                    self.snapshot_manager.prune_orphan_restore_scripts()
+                except Exception as _e:
+                    ZeroFallLogger.warning("[启动清理] 清理死恢复脚本失败: {}".format(_e))
                 rec = self.snapshot_manager.reconcile_with_disk()
                 pruned = rec.get('pruned') or []
                 adopted = rec.get('adopted') or []
+                # 老索引里"标了完整、却没有 runtime_included"的条目只能按体积猜，
+                # 而 100 MB 这条界线早就不成立了（P1/P3 之后完整包也只有 79 MB）。
+                # 这类条目当场开包里看一眼，把真实结论写回索引。
+                runtime_filled = 0
+                try:
+                    runtime_filled = self.snapshot_manager.backfill_runtime_included()
+                except Exception as _e:
+                    ZeroFallLogger.warning(
+                        "[启动清理] 回填 runtime_included 失败: {}".format(_e))
                 # 修正历史上被旧判据误标成崩溃的快照（notes 里没写"崩溃"的那些）。
                 # 旧判据只看"创建时 DeepSeek 在不在跑"，手动快照和环境校验失败
                 # 期间的定时快照都会被误标，占满 max_crashed_snapshots 名额。
@@ -1339,11 +2164,25 @@ class ZeroFallMainWindow(QMainWindow):
                         keep_days=config_int(self.config, 'log_backup_count', 5))
                 except Exception:
                     logs = 0
-                if pruned or adopted or dirs or bad or logs:
+                # P7（2026-11-16）：给还没恢复脚本的快照补一份。
+                # 快照可能是"索引重建时被登记成孤儿"来的（staging 遗留），
+                # 那条路径只写索引、不生成 .cmd；结果换台没装 ZeroFall 的机器时
+                # 这个包就成了只能靠本程序打开的死数据（实测 snapshot_20261115_142438）。
+                # write_restore_scripts() 幂等，只补缺的，不会覆盖已有脚本。
+                scripts = {'written': 0, 'skipped': 0, 'missing': 0}
+                try:
+                    scripts = self.snapshot_manager.write_restore_scripts()
+                except Exception as _e:
+                    ZeroFallLogger.warning("[启动清理] 补恢复脚本失败: {}".format(_e))
+
+                if (pruned or adopted or dirs or bad or logs or runtime_filled
+                        or scripts.get('written')):
                     ZeroFallLogger.info(
                         "[启动清理] 临时目录 {} 个、截断包 {} 个、"
-                        "失效条目 {} 个、孤儿快照 {} 个、过期日志 {} 个".format(
-                            len(dirs), len(bad), len(pruned), len(adopted), logs))
+                        "失效条目 {} 个、孤儿快照 {} 个、回填运行时标记 {} 份、"
+                        "补恢复脚本 {} 个、过期日志 {} 个".format(
+                            len(dirs), len(bad), len(pruned), len(adopted),
+                            runtime_filled, scripts.get('written', 0), logs))
                     try:
                         self.snapshot_manager.reload_index()
                     except Exception:
@@ -1404,6 +2243,7 @@ class ZeroFallMainWindow(QMainWindow):
                     full.snapshot_id, mb, time.time() - t0))
                 QTimer.singleShot(0, lambda s=full.snapshot_id, m=mb: self.statusBar().showMessage(
                     "已生成今日完整快照 {}（{:.1f} MB）".format(s, m), 20000))
+                self._notify_snapshot_tab()
                 return True
             ZeroFallLogger.warning("[每日完整快照] 创建失败")
             return False
@@ -1518,6 +2358,7 @@ class ZeroFallMainWindow(QMainWindow):
             if prev is None:
                 # 首次只记基准，不把"启动时的状态"当成一次变更
                 self._drift_fingerprint = fp
+                self._drift_parts = getattr(self.env_checker, 'last_parts', None) or []
                 ZeroFallLogger.info(
                     "[变更检测] 已记录插件环境基准指纹 {}".format(fp[:12]))
                 return
@@ -1535,6 +2376,30 @@ class ZeroFallMainWindow(QMainWindow):
                 last_snap = getattr(self, '_drift_last_snapshot_at', 0.0)
                 if cooldown > 0 and (now - last_snap) < cooldown:
                     return
+
+                # 防抖上限（2026-11-12 自检）：只要还剩一个漏网的易变文件，指纹
+                # 就会每分钟变一次，"静置 settle 秒"永远等不到 —— 实测日志每分
+                # 钟一条 [变更检测]，快照点反而被无限推迟。连续变化超过上限就先
+                # 拍一份止血，别让回退点一直往后拖。
+                if getattr(self, '_drift_first_changed_at', None) is None:
+                    self._drift_first_changed_at = now
+                cap_s = getattr(self.config, 'plugin_drift_max_defer_seconds', 1800)
+                cap_s = int(cap_s) if cap_s else 1800
+                first_changed = getattr(self, '_drift_first_changed_at', None)
+                if first_changed is None:
+                    first_changed = now
+                if (now - first_changed) >= cap_s:
+                    self._drift_changed_at = None
+                    self._drift_first_changed_at = None
+                    ZeroFallLogger.info(
+                        "[变更检测] 指纹持续变化超 {} 分钟，先拍一份快照止血"
+                        .format(max(1, int(cap_s // 60))))
+                    self._create_drift_snapshot()
+                    return
+
+                detail = getattr(self, '_log_drift_detail', None)
+                if detail:
+                    detail()
 
                 self._drift_changed_at = now
                 ZeroFallLogger.info(
@@ -1556,9 +2421,36 @@ class ZeroFallMainWindow(QMainWindow):
                 return        # 还在变化中，继续等
 
             self._drift_changed_at = None
+            self._drift_first_changed_at = None
             self._create_drift_snapshot()
         except Exception as e:
             ZeroFallLogger.warning("[变更检测] 检查异常: {}".format(e))
+
+    def _log_drift_detail(self):
+        """指纹变了 → 把"到底哪几个文件变了"写进日志（每 5 分钟最多一条）
+
+        没有它，日志只会说"指纹变了"，排查还得另写脚本采样两次做差集。
+        明细复用 quick_fingerprint() 顺着 stat 时留下的 self.last_parts，
+        不额外走一遍目录（插件目录现在四万多个文件，多走一遍是纯浪费）。
+        """
+        try:
+            now = time.time()
+            if now - getattr(self, '_drift_detail_logged_at', 0.0) < 300:
+                return
+            cur = getattr(self.env_checker, 'last_parts', None) or []
+            old = getattr(self, '_drift_parts', None) or []
+            self._drift_parts = cur
+            if not cur or not old:
+                return
+            diff = sorted(set(cur) ^ set(old))[:6]
+            if not diff:
+                return
+            self._drift_detail_logged_at = now
+            ZeroFallLogger.info(
+                "[变更检测] 差异前 6 条（key|路径|mtime|大小）：{}".format(
+                    [d[:110] for d in diff]))
+        except Exception as e:
+            ZeroFallLogger.warning("[变更检测] 差异定位失败: {}".format(e))
 
     def _create_drift_snapshot(self):
         """因检测到改动而打快照（后台线程，避免卡 UI）"""
@@ -1579,6 +2471,7 @@ class ZeroFallMainWindow(QMainWindow):
                     QTimer.singleShot(0, lambda s=snap.snapshot_id:
                                       self.statusBar().showMessage(
                                           "检测到环境改动，已创建快照 {}".format(s), 12000))
+                    self._notify_snapshot_tab()
                 else:
                     ZeroFallLogger.warning("[变更检测] 变更点快照创建失败")
                     self._report_zf_error(
@@ -1593,6 +2486,87 @@ class ZeroFallMainWindow(QMainWindow):
         threading.Thread(target=_work, daemon=True,
                          name="ZeroFall-DriftSnap").start()
 
+    def _dsh_version_marker(self) -> str:
+        """找 DSH 版本标记（实测在快照目录下：<snapshot_dir>\\.dsh_version）"""
+        cands = []
+        snap = getattr(self.config, 'snapshot_dir', '') or ''
+        cfgdir = getattr(self.config, 'deepseek_config_dir', '') or ''
+        for base in (snap, cfgdir):
+            if base:
+                cands.append(Path(base) / '.dsh_version')
+        cands.append(Path.home() / '.dsh' / '.dsh_version')
+        for p in cands:
+            try:
+                if p.is_file():
+                    v = p.read_text(encoding='utf-8', errors='replace').strip()
+                    if v:
+                        return v[:64]
+            except Exception:
+                continue
+        return ''
+
+    def _runtime_signature(self) -> str:
+        """没有版本标记时的兜底指纹：primary-runtime 的文件数 + 总字节
+
+        6130 个文件、256 MB，一次全量 stat 约几十毫秒，30 分钟跑一次可忽略；
+        运行时升级/降级必然改变这个数，够用来判断"要不要再带一份"。
+        """
+        base = Path(getattr(self.config, 'deepseek_config_dir', '') or '') / 'primary-runtime'
+        if not base.is_dir():
+            return ''
+        count = 0
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(base):
+                for fn in files:
+                    try:
+                        total += (Path(root) / fn).stat().st_size
+                        count += 1
+                    except OSError:
+                        continue
+        except Exception:
+            return ''
+        return 'rt:{}-{}'.format(count, total // (1024 * 1024))
+
+    def _full_snapshot_needs_runtime(self) -> bool:
+        """定时完整快照要不要带 primary-runtime（2026-11-12）
+
+        实测：一份完整快照里 config/primary-runtime 占 227 MB（压缩后 ~140 MB，
+        全包 165-171 MB），而 12 份完整快照里 11 份是同一份运行时 —— D: 上纯重复 1.7 GB。
+        运行时只在 DSH 升级时变，所以默认按版本标记去重：标记没变就不带，
+        每天那份（daily）照旧带，恢复链不缺运行时。
+        没有版本标记时退回"运行时文件数+字节数"指纹，同样能识别升级。
+        """
+        mode = str(getattr(self.config, 'full_snapshot_runtime_mode',
+                            'on_change') or 'on_change').lower()
+        if mode == 'always':
+            return True
+        if mode == 'never':
+            return False
+        ver = self._dsh_version_marker()
+        sig = ver or self._runtime_signature()
+        state_file = Path(getattr(self.config, 'snapshot_dir', '') or '.') / '.runtime_in_full.json'
+        state = {}
+        try:
+            if state_file.is_file():
+                state = json.loads(state_file.read_text(encoding='utf-8')) or {}
+        except Exception:
+            state = {}
+        seen = str(state.get('signature') or state.get('version') or '')
+        if sig and seen == sig:
+            ZeroFallLogger.info(
+                "[完整快照] 运行时未变（{}），跳过 primary-runtime 省盘".format(sig))
+            return False
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps(
+                {'signature': sig, 'version': ver,
+                 'at': time.strftime('%Y-%m-%d %H:%M:%S')},
+                ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+        return True
+
     def _create_timed_full_snapshot(self, interval: int):
         """后台线程创建完整快照，避免卡 UI（150~300 MB 要写几秒）"""
         import threading
@@ -1600,10 +2574,12 @@ class ZeroFallMainWindow(QMainWindow):
 
         def _work():
             try:
+                include_runtime = self._full_snapshot_needs_runtime()
                 full = self.snapshot_manager.create_snapshot(
                     notes="定时完整快照（每{}分钟）".format(interval),
                     force_healthy=True,
-                    include_runtime=True,
+                    include_runtime=include_runtime,
+                    is_full=True,
                 )
                 if full:
                     try:
@@ -1617,6 +2593,7 @@ class ZeroFallMainWindow(QMainWindow):
                                       self.statusBar().showMessage(
                                           "已生成定时完整快照 {}（{:.1f} MB）".format(s, m),
                                           15000))
+                    self._notify_snapshot_tab()
                 else:
                     ZeroFallLogger.warning("[完整快照] 定时完整快照创建失败")
             except Exception as e:
@@ -1646,6 +2623,69 @@ class ZeroFallMainWindow(QMainWindow):
         import threading
         threading.Thread(target=_work, daemon=True, name="ZeroFall-DailyFull").start()
 
+    def _current_content_fingerprint(self) -> str:
+        """当前"插件 + 配置"的内容指纹（跟变更检测用的是同一套）"""
+        try:
+            fp = self.env_checker.quick_fingerprint()
+            return str(fp or '')
+        except Exception:
+            return ''
+
+    def _should_skip_unchanged_snapshot(self) -> bool:
+        """静默快照要不要因为"内容没变"而跳过
+
+        2026-11-12：静默快照 10 分钟一份、每份 42 MB 目录 + 24.5 MB 压缩包，
+        而插件/配置大部分时间根本没动 —— 同一份内容反复拍，纯烧磁盘和 CPU。
+        用和变更检测同一套指纹判断；指纹为空（读不到插件目录等）时保守照打。
+
+        注意：只拦自动流程。用户手动「快速快照」不走这里，永远照打。
+        """
+        try:
+            if not bool(getattr(self.config, 'silent_snapshot_skip_unchanged', True)):
+                return False
+        except Exception:
+            pass
+        fp = self._current_content_fingerprint()
+        if not fp:
+            return False
+        last = getattr(self, '_last_light_fingerprint', None)
+        if not last:
+            # 首次没有基准：照常打一份，同时把基准记下来（不能拿"启动"当变更）
+            self._last_light_fingerprint = fp
+            return False
+        if fp == last:
+            # 兜底：万一指纹卡死不变（比如插件目录被挪走、指纹恒为同一个值），
+            # 也不能让快照链断掉 —— 超过 N 小时还是硬打一份。
+            gap_h = config_int(self.config, 'silent_snapshot_max_gap_hours', 6)
+            if gap_h > 0:
+                newest = self._newest_light_time()
+                if newest is not None:
+                    age_h = (datetime.now() - newest).total_seconds() / 3600.0
+                    if age_h >= gap_h:
+                        ZeroFallLogger.info(
+                            "[生命周期] 指纹虽未变，但已 {:.1f} 小时没打快照，补一份".format(age_h))
+                        return False
+            ZeroFallLogger.debug(
+                "[生命周期] 插件/配置指纹未变（{}），跳过本轮静默快照".format(fp[:12]))
+            return True
+        return False
+
+    def _newest_light_time(self):
+        """最近一份轻量快照的时间（datetime），没有则 None"""
+        try:
+            snaps = self.snapshot_manager.get_light_snapshots() or []
+            best = None
+            for s in snaps:
+                try:
+                    t = datetime.strptime(str(getattr(s, 'created_at', '')), '%Y%m%d_%H%M%S')
+                except Exception:
+                    continue
+                if best is None or t > best:
+                    best = t
+            return best
+        except Exception:
+            return None
+
     def _run_snapshot_lifecycle(self):
         """快照生命周期主流程
         
@@ -1658,6 +2698,13 @@ class ZeroFallMainWindow(QMainWindow):
         
         # 0) 每日首个完整快照（放在轻量之前，保证当天基线最新）
         self._ensure_daily_full_snapshot(is_running)
+
+        # 0.5) 内容没变就别再拍一份（2026-11-12）
+        # 静默快照每 10 分钟一次，实测一天 27 份 × 42 MB，其中绝大部分时间里
+        # 插件和配置一个字都没改 —— 拍出来的是同一份东西。指纹没变直接跳过，
+        # 省掉一次 42 MB 目录复制 + 24.5 MB 压缩 + 一次云归档判断。
+        if self._should_skip_unchanged_snapshot():
+            return
         
         # 1) 轻量快照
         snap = self.snapshot_manager.create_snapshot(
@@ -1672,6 +2719,13 @@ class ZeroFallMainWindow(QMainWindow):
                     getattr(self.config, 'snapshot_dir', ''))})
             return
         ZeroFallLogger.info("静默快照创建成功: {}".format(snap.snapshot_id))
+        # 记下这一份的内容指纹，下一轮拿它比对
+        try:
+            self._last_light_fingerprint = self._current_content_fingerprint() or \
+                getattr(self, '_last_light_fingerprint', None)
+        except Exception:
+            pass
+        self._notify_snapshot_tab()
         
         # 2) 完整快照触发：定时模式下由 _check_full_snapshot_interval 负责，
         #    这里仅在定时模式关闭（interval<=0）时退回"每 N 个轻量"老逻辑
@@ -1773,7 +2827,55 @@ class ZeroFallMainWindow(QMainWindow):
             overflow = light_overflow + full_overflow + crash_overflow
             if not overflow:
                 return
-            
+
+            # ── 轻量快照：默认直接删本地，不逐个上传 ──
+            # 2026-11-12：这条路原来是"每个溢出的轻量快照都加密上传再删本地"，
+            # 完全绕过 conf 里的抽样策略 —— 实测一天往百度网盘塞 94 个文件 / 1.2 GB，
+            # 同步进程常驻内存 2 GB。云端历史靠抽样的完整快照就够了（30 分钟一个），
+            # 所以默认删；想留 10 分钟粒度就配 cloud_overflow_light_policy=archive。
+            policy = str(getattr(self.config, 'cloud_overflow_light_policy',
+                                 'delete') or 'delete').lower()
+            if light_overflow and policy == 'delete':
+                keep = []
+                dropped = 0
+                fulls = [s for s in self.snapshot_manager.get_full_snapshots()
+                         if not getattr(s, 'is_full', None) is False]
+                for s in light_overflow:
+                    # 安全阀：必须有更晚的完整快照覆盖这个时间窗，否则还是老实上传
+                    covered = any(str(getattr(f, 'created_at', '')) >
+                                  str(getattr(s, 'created_at', ''))
+                                  for f in fulls)
+                    if not covered:
+                        keep.append(s)
+                        continue
+                    if self.snapshot_manager.delete_snapshot(s.snapshot_id):
+                        dropped += 1
+                if dropped:
+                    ZeroFallLogger.info(
+                        "[生命周期] 轻量快照溢出 {} 个，按 light_policy=delete 直接删本地"
+                        "（云端完整快照已覆盖同一时间窗，省网盘带宽）".format(dropped))
+                light_overflow = keep
+                overflow = light_overflow + full_overflow + crash_overflow
+                if not overflow:
+                    return
+
+            # ── 上传刹车：每日总量 + 每轮个数 ──
+            # 一轮塞 10 个文件时，网盘客户端会并发开一堆上传任务，内存峰值直接翻倍。
+            cap_day = config_int(self.config, 'cloud_upload_max_per_day', 24)
+            cap_cycle = config_int(self.config, 'cloud_upload_per_cycle', 2)
+            done_today = self._cloud_uploads_today()
+            if cap_day and done_today >= cap_day:
+                ZeroFallLogger.info(
+                    "[生命周期] 今日云端上传已达上限 {}/{}，{} 个留在本地等明天再传".format(
+                        done_today, cap_day, len(overflow)))
+                return
+            budget = len(overflow)
+            if cap_cycle:
+                budget = min(budget, cap_cycle)
+            if budget < len(overflow):
+                ZeroFallLogger.info(
+                    "[生命周期] 本轮只归档 {} 个（每轮上限 {}，其余下一轮继续）".format(
+                        budget, cap_cycle))
             self._archive_busy = True
             ZeroFallLogger.info(
                 "[生命周期] 本地溢出 {} 个快照（轻量 {} / 完整 {} / 崩溃 {}），开始云归档".format(
@@ -1787,26 +2889,55 @@ class ZeroFallMainWindow(QMainWindow):
             if not sync_dir:
                 ZeroFallLogger.warning("[生命周期] 未配置云同步目录，跳过期归档")
                 return
+
+            # 窗口模式 + 不在窗口内：先落到本地 outbox，等窗口打开再一次性搬进同步盘。
+            # 这样白天网盘客户端可以完全不开，也不必每小时面对一堆待传包。
+            target_dir = sync_dir
+            staged = False
+            if (getattr(self.config, 'cloud_outbox_enabled', True)
+                    and not self._cloud_in_window()):
+                outbox_limit = self._cloud_outbox_limit()
+                if outbox_limit > 0 and self._cloud_outbox_count() >= outbox_limit:
+                    ZeroFallLogger.info(
+                        "[生命周期] 暂存区已满 {}/{}，{} 个快照留在本地等窗口".format(
+                            self._cloud_outbox_count(), outbox_limit, len(overflow)))
+                    return
+                target_dir = self._cloud_outbox_path()
+                try:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    ZeroFallLogger.warning("[生命周期] 暂存区不可用: {}".format(e))
+                    return
+                staged = True
             
             # 连续失败上限：避免同一批快照无限重试刷日志（活锁保护）
             if not hasattr(self, '_archive_fail_count'):
                 self._archive_fail_count = {}
             MAX_FAIL = 3
+            uploaded = 0
             
             for s in overflow:
+                if uploaded >= budget:
+                    break
                 sid = s.snapshot_id
                 fails = self._archive_fail_count.get(sid, 0)
                 if fails >= MAX_FAIL:
                     # 反复失败的直接放弃，不再每轮重试
                     continue
                 
-                ok = self._archive_snapshot_to_cloud(s, sync_dir, encrypt)
+                ok = self._archive_snapshot_to_cloud(s, target_dir, encrypt)
                 if ok:
+                    uploaded += 1
                     self._archive_fail_count.pop(sid, None)
                     self.snapshot_manager.delete_snapshot(s.snapshot_id)
-                    ZeroFallLogger.info(
-                        "[生命周期] 快照 {} 已云归档并删除本地".format(s.snapshot_id)
-                    )
+                    if staged:
+                        ZeroFallLogger.info(
+                            "[生命周期] 快照 {} 已暂存 outbox（等同步窗口搬进同步盘，"
+                            "本地副本已删）".format(s.snapshot_id))
+                    else:
+                        ZeroFallLogger.info(
+                            "[生命周期] 快照 {} 已云归档并删除本地".format(s.snapshot_id)
+                        )
                 else:
                     self._archive_fail_count[sid] = fails + 1
                     if self._archive_fail_count[sid] >= MAX_FAIL:
@@ -1862,6 +2993,30 @@ class ZeroFallMainWindow(QMainWindow):
             return True
         return False
 
+    def _cloud_uploads_today(self) -> int:
+        """今天已经往同步盘写了多少个快照包
+
+        用文件 mtime 算，不额外存状态：跨重启、跨时区都对得上，也不需要清理。
+        只数 snapshot_*.zip / *.zip.enc，.meta.json 之类的小文件不算。
+        """
+        try:
+            d = Path(getattr(self.config, 'cloud_sync_dir', '') or '')
+            if not d or not d.exists():
+                return 0
+            today = datetime.now().date()
+            n = 0
+            for f in d.glob('snapshot_*.zip*'):
+                if f.name.endswith('.json'):
+                    continue
+                try:
+                    if datetime.fromtimestamp(f.stat().st_mtime).date() == today:
+                        n += 1
+                except OSError:
+                    continue
+            return n
+        except Exception:
+            return 0
+
     def _archive_snapshot_to_cloud(self, snapshot, sync_dir: Path, encrypt: bool) -> bool:
         """把单个快照归档到云同步盘（复用加密同步逻辑，不触发云清理）"""
         try:
@@ -1870,9 +3025,41 @@ class ZeroFallMainWindow(QMainWindow):
             ZeroFallLogger.error("[生命周期] 归档快照 {} 异常: {}".format(snapshot.snapshot_id, e))
             return False
     
+    def _cloud_consolidated_path(self) -> Path:
+        base = Path(getattr(self.config, 'snapshot_dir', '') or '.')
+        return base / '.cloud_consolidated.json'
+
+    def _load_cloud_consolidated(self) -> set:
+        """读"已收敛过的日期"（跨重启有效，最多留 60 天）"""
+        try:
+            p = self._cloud_consolidated_path()
+            if p.is_file():
+                raw = json.loads(p.read_text(encoding='utf-8'))
+                if isinstance(raw, list):
+                    return {str(x) for x in raw if str(x).strip()}
+        except Exception as _e:
+            ZeroFallLogger.debug("[云端收敛] 读收敛记录失败: {}".format(_e))
+        return set()
+
+    def _save_cloud_consolidated(self, dates) -> None:
+        try:
+            p = self._cloud_consolidated_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            keep = sorted({str(d) for d in dates})[-60:]
+            p.write_text(json.dumps(keep, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as _e:
+            ZeroFallLogger.debug("[云端收敛] 写收敛记录失败: {}".format(_e))
+
     def _consolidate_cloud_daily(self):
         """次日开机云端收敛：对前一天（昨天）的快照各保留 1 个最优，删除其余"""
         if not getattr(self.config, 'daily_cloud_consolidate', True):
+            return
+        # 窗口模式下删同步盘文件必须有客户端在线：离线删除下次联网很可能被云端
+        # 重新拉回来（白删一遍，还多一轮下载）。客户端在跑就不用等窗口。
+        if (self._cloud_client_mode() == 'windowed'
+                and not self._cloud_in_window()
+                and not self._baidu_client_running()):
+            ZeroFallLogger.debug("[云端收敛] 窗口模式 + 客户端离线，跳过删除动作")
             return
         try:
             sync_dir = Path(getattr(self.config, 'cloud_sync_dir', ''))
@@ -1883,10 +3070,33 @@ class ZeroFallMainWindow(QMainWindow):
             yesterday = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y%m%d")
             
             # 避免同一日期反复收敛
-            if yesterday in getattr(self, '_cloud_consolidated_dates', set()):
-                return
-            
+            # 2026-11-12：原来只记在内存里，程序每重启一次就重扫一遍云端并再删一轮
+            # （实测一天 159 行收敛日志、12 次重复扫描）。改成落盘，跨重启只做一次。
+            #
+            # 2026-11-14：光有标记还不够 —— 离线时删掉的同步盘文件，客户端下次联网
+            # 会从云端重新拉回来。实测 .cloud_consolidated.json 里 11-11 / 11-12 都写着
+            # "已收敛"，但云端实际还各有 8 / 24 个包。所以改成按实际文件数判定：
+            # 删完还剩超过 2 个，就不记账，下一轮继续试（同一天最多试 3 次）。
+            done = self._load_cloud_consolidated()
+            self._cloud_consolidated_dates = done
             encrypt = bool(getattr(self.config, 'cloud_sync_encrypt', False))
+
+            _left = self._cloud_day_package_count(yesterday, encrypt)
+            if _left <= 2:
+                if yesterday not in done:
+                    done.add(yesterday)
+                    self._save_cloud_consolidated(done)
+                return
+            _fails = getattr(self, '_consolidate_fail_count', None)
+            if _fails is None:
+                _fails = {}
+                self._consolidate_fail_count = _fails
+            if _fails.get(yesterday, 0) >= 3:
+                ZeroFallLogger.info(
+                    "[云端收敛] 昨日({}) 连续 3 次没删干净（客户端多半又把文件拉回来了），"
+                    "本轮起跳过".format(yesterday))
+                return
+
             pattern = "snapshot_{}_*.zip.enc".format(yesterday) if encrypt else "snapshot_{}_*.zip".format(yesterday)
             
             # 按文件名解析：snapshot_YYYYMMDD_HHMMSS.zip(.enc)
@@ -1897,16 +3107,28 @@ class ZeroFallMainWindow(QMainWindow):
                     return parts[1]  # HHMMSS
                 return ""
             
-            # 用大小区分轻量/完整（>100MB 视为完整）
+            # 轻量/完整按 meta 里的 is_full 分类；拿不到 meta 才退回按大小猜。
+            # 原来只按"体积 > 100 MB 算完整"，而现在完整快照加密后约 30 MB，
+            # 会被全部当成轻量 —— 一天 16 个完整快照最后只剩 1 个，等于把恢复点删光。
             THRESHOLD = 100 * 1024 * 1024
-            light = []
-            full = []
-            for f in sync_dir.glob(pattern):
+
+            def _is_full(f):
+                base = f.name[:-4] if f.name.endswith('.enc') else f.name
+                meta = sync_dir / (base + '.meta.json')
+                if meta.is_file():
+                    try:
+                        raw = json.loads(meta.read_text(encoding='utf-8'))
+                        if 'is_full' in raw:
+                            return bool(raw.get('is_full'))
+                    except Exception:
+                        pass
                 try:
-                    size = f.stat().st_size
+                    return f.stat().st_size > THRESHOLD
                 except Exception:
-                    continue
-                (full if size > THRESHOLD else light).append(f)
+                    return False
+
+            light = [f for f in sync_dir.glob(pattern) if not _is_full(f)]
+            full = [f for f in sync_dir.glob(pattern) if _is_full(f)]
             
             removed = 0
             # 轻量：保留时间最晚（最好）的 1 个
@@ -1915,7 +3137,8 @@ class ZeroFallMainWindow(QMainWindow):
                 try:
                     self._unlink_cloud_with_meta(f)
                     removed += 1
-                    ZeroFallLogger.info("[云端收敛] 删除昨日冗余轻量快照: {}".format(f.name))
+                    ZeroFallLogger.debug(
+                        "[云端收敛] 删除昨日冗余轻量快照: {}".format(f.name))
                 except Exception:
                     pass
             # 完整：保留时间最晚（最好）的 1 个
@@ -1924,18 +3147,30 @@ class ZeroFallMainWindow(QMainWindow):
                 try:
                     self._unlink_cloud_with_meta(f)
                     removed += 1
-                    ZeroFallLogger.info("[云端收敛] 删除昨日冗余完整快照: {}".format(f.name))
+                    ZeroFallLogger.debug(
+                        "[云端收敛] 删除昨日冗余完整快照: {}".format(f.name))
                 except Exception:
                     pass
             
             if removed:
                 ZeroFallLogger.info(
-                    "[云端收敛] 昨日({})快照已收敛：保留 1 轻量 + 1 完整，删除 {} 个".format(yesterday, removed)
+                    "[云端收敛] 昨日({})快照已收敛：轻量 {}→1、完整 {}→1，删除 {} 个".format(
+                        yesterday, len(light), len(full), removed)
                 )
             else:
                 ZeroFallLogger.info("[云端收敛] 昨日({})无需收敛（不足 2 个冗余）".format(yesterday))
-            
-            self._cloud_consolidated_dates.add(yesterday)
+
+            # 只有真的删干净了才记账；否则下一轮再试（客户端可能正在把文件拉回来）
+            _remain = self._cloud_day_package_count(yesterday, encrypt)
+            if _remain <= 2:
+                done.add(yesterday)
+                self._save_cloud_consolidated(done)
+                _fails.pop(yesterday, None)
+            else:
+                _fails[yesterday] = _fails.get(yesterday, 0) + 1
+                ZeroFallLogger.warning(
+                    "[云端收敛] 昨日({}) 删了 {} 个但还剩 {} 个，下一轮再试（第 {}/3 次）".format(
+                        yesterday, removed, _remain, _fails[yesterday]))
 
             # 收敛完顺手清理过期历史：只做收敛不清历史的话，云端会无限增长
             try:
@@ -1945,6 +3180,18 @@ class ZeroFallMainWindow(QMainWindow):
         except Exception as e:
             ZeroFallLogger.error("[云端收敛] 异常: {}".format(e))
     
+    def _cloud_day_package_count(self, day: str, encrypt: bool) -> int:
+        """某个日期在同步盘里还剩几个快照包（.meta.json 不算）"""
+        try:
+            sync_dir = Path(getattr(self.config, 'cloud_sync_dir', '') or '')
+            if not sync_dir.is_dir():
+                return 0
+            pat = ("snapshot_{}_*.zip.enc".format(day) if encrypt
+                   else "snapshot_{}_*.zip".format(day))
+            return len(list(sync_dir.glob(pat)))
+        except Exception:
+            return 0
+
     def _prune_cloud_history(self):
         """清掉云端超过保留期的整组快照
 
@@ -2182,6 +3429,17 @@ class ZeroFallMainWindow(QMainWindow):
                 tab.refresh_snapshot_list()
         except Exception as e:
             ZeroFallLogger.warning("[快照页] 刷新失败: {}".format(e))
+    
+    def _notify_snapshot_tab(self):
+        """后台线程打完快照后，切回主线程让快照页立刻更新
+
+        快照页自带 5 秒自动刷新做兜底，这里给一条"打完就看得见"的路径：
+        否则刚生成的快照要等到下一轮轮询才出现在列表里。
+        """
+        try:
+            QTimer.singleShot(0, self._refresh_snapshot_tab)
+        except Exception:
+            pass
 
     def _refresh_health_status(self):
         """刷新顶部状态面板的环境健康度"""
@@ -2477,6 +3735,7 @@ class ZeroFallMainWindow(QMainWindow):
                             QTimer.singleShot(0, lambda: self.statusBar().showMessage(
                                 "检测到 DSH 版本升级（{} -> {}），已创建完整快照".format(old, ver), 20000
                             ))
+                            self._notify_snapshot_tab()
                     except Exception as _e:
                         ZeroFallLogger.warning("[版本检测] 升级基线创建失败: {}".format(_e))
                 _th_ver.Thread(target=_make_ver_baseline, daemon=True,
@@ -2853,6 +4112,81 @@ class ZeroFallMainWindow(QMainWindow):
         except Exception:
             pass
     
+    def _relay_to_doubao(self, exit_code: int):
+        """保留现场后，把崩溃交给豆包：拉起 → 新对话 → 粘贴提示词 → 回车。
+
+        只在"不回退快照、保留现场"的路径上调用（现场没被冲掉，豆包看到的才是真现场）。
+        全程在后台线程里跑：不阻塞 UI，任何失败只记日志，绝不把崩溃处理再拖崩一次。
+        """
+        if not getattr(self.config, 'doubao_relay_on_crash', True):
+            ZeroFallLogger.info("[豆包接力] 设置里已关闭（doubao_relay_on_crash=False），跳过")
+            return
+        try:
+            from modules import doubao_relay as dr
+        except Exception as e:            # noqa: BLE001
+            ZeroFallLogger.warning("[豆包接力] 模块加载失败: {}".format(e))
+            return
+
+        appdata = getattr(self.config, 'dsh_appdata_dir', '') or ''
+        crash_path = None
+        crash_text = ""
+        category = "unknown"
+        category_reason = ""
+        try:
+            from modules.crash_classifier import read_latest_crash_log, classify_crash_log
+            crash_path, crash_text = read_latest_crash_log(appdata)
+            if crash_text:
+                category, category_reason = classify_crash_log(crash_text)
+        except Exception:                 # noqa: BLE001 - 拿不到日志也要能把接力跑完
+            crash_path = None
+        crash_dir = str(Path(appdata) / "logs") if appdata else ""
+        prompt_tpl = getattr(self.config, 'doubao_relay_prompt', '') or ""
+        exe_hint = getattr(self.config, 'doubao_exe', '') or ""
+
+        # 按崩溃类别给豆包补一句"先看哪里"，比让它从零猜快得多
+        _HINTS = {
+            "auth_failed": "\n- 已知分类：认证失败（优先看 Cookies / Local Storage 的凭证态，不要先动插件）",
+            "plugin_error": "\n- 已知分类：插件 / Node 模块错误（优先看 profile 的 cordis.patch.yml、node_modules 链接、pnpm-lock）",
+            "runtime_error": "\n- 已知分类：运行时 / 渲染进程崩溃（优先看内存、GPU 进程、crashpad 记录）",
+        }
+        extra = _HINTS.get(category, "")
+        if category_reason:
+            extra += "\n- 分类依据：{}".format(category_reason)
+
+        def _work():
+            try:
+                # 接力前先把快照备一份：豆包要读的是"崩溃现场"，别让后续修复动作把它冲掉。
+                try:
+                    from modules import resume_guard as rg
+                    bak = rg.backup_snapshot(rg.resolve_home(self.config), tag="zf-resume-precrash")
+                    if bak:
+                        ZeroFallLogger.info("[豆包接力] 已备份崩溃前快照 → {}".format(bak))
+                except Exception as exc:      # noqa: BLE001
+                    ZeroFallLogger.warning("[豆包接力] 快照备份失败: {}".format(exc))
+
+                rep = dr.relay(
+                    exit_code=exit_code,
+                    crash_log=str(crash_path) if crash_path else "",
+                    crash_dir=crash_dir,
+                    profile="desktop",
+                    prompt_template=prompt_tpl,
+                    exe_hint=exe_hint,
+                    extra=extra,
+                )
+                ZeroFallLogger.info(
+                    "[豆包接力] 分类={} ok={} | {} | {}".format(
+                        category,
+                        rep.get("ok"),
+                        " → ".join(rep.get("steps") or []),
+                        rep.get("error") or "无错误",
+                    )
+                )
+            except Exception as exc:      # noqa: BLE001
+                ZeroFallLogger.warning("[豆包接力] 异常: {}".format(exc))
+
+        import threading as _th_doubao
+        _th_doubao.Thread(target=_work, daemon=True, name="ZeroFall-DoubaoRelay").start()
+
     def _on_deepseek_crash(self, exit_code: int):
         """DeepSeek崩溃回调（在监控线程中调用，必须切回主线程处理 UI）"""
         ZeroFallLogger.critical("DeepSeek 崩溃，退出码: {}".format(exit_code))
@@ -2865,6 +4199,16 @@ class ZeroFallMainWindow(QMainWindow):
             # 1) 后台留一份崩溃环境快照（263MB/十几秒，不能卡主线程）
             import threading as _th_crash_snap
             def _make_crash_snap():
+                # 崩溃快照之前先把「谁在跑」的快照单独备一份：
+                # profile 快照体积大、耗时长，而 resume-sessions.json 决定"重启后恢复谁"，
+                # 万一恢复流程中途失败或被人重装 profile，这份还能拿来手动补。
+                try:
+                    from modules import resume_guard as rg
+                    bak = rg.backup_snapshot(rg.resolve_home(self.config), tag="zf-resume-crash")
+                    if bak:
+                        ZeroFallLogger.info("[崩溃快照] 已备份会话快照 → {}".format(bak))
+                except Exception as exc:      # noqa: BLE001
+                    ZeroFallLogger.warning("[崩溃快照] 会话快照备份失败: {}".format(exc))
                 try:
                     self.snapshot_manager.create_snapshot(
                         notes="崩溃快照 (退出码 {})".format(exit_code),
@@ -2899,6 +4243,8 @@ class ZeroFallMainWindow(QMainWindow):
                 else:
                     ZeroFallLogger.warning(
                         "[崩溃告警] 告警已关闭，仅记录：退出码 {}".format(exit_code))
+                # 保留现场 → 把现场交给豆包分析（不回退快照，现场就在那里）
+                self._relay_to_doubao(exit_code)
                 return
 
             # 4) 防无限循环 —— 达到上限后不再是"直接掐断"，而是交给人工定
@@ -2921,6 +4267,7 @@ class ZeroFallMainWindow(QMainWindow):
                     ZeroFallLogger.warning(
                         "[崩溃告警] 告警已关闭，无人可确认，保守停手不再自动回退")
                     self._rollback_count = 0
+                    self._relay_to_doubao(exit_code)
                     return
                 ret = QMessageBox.question(
                     self, "已多次回退仍未恢复",
@@ -2937,6 +4284,7 @@ class ZeroFallMainWindow(QMainWindow):
                     ZeroFallLogger.info(
                         "[崩溃恢复] 用户选择停手，保留现场不再自动回退")
                     self._rollback_count = 0
+                    self._relay_to_doubao(exit_code)
                     return
                 ZeroFallLogger.info(
                     "[崩溃恢复] 用户确认继续回退（已重置计数，下次到上限会再次询问）")

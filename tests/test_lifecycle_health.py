@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 统一以项目根为 cwd
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
+from datetime import datetime  # noqa: E402
+from utils import config_int as _config_int  # noqa: E402
+
 PASS, FAIL = [], []
 
 
@@ -228,6 +231,11 @@ def test_archive_fail_cap():
         cloud_overflow_enabled = True
         cloud_sync_dir = 'X:/fake'
         cloud_sync_encrypt = False
+        # 这一节测的是"归档失败上限"，得让轻量快照真的去归档；
+        # 默认策略是 delete（2026-11-12 改成省网盘带宽），会走删除分支。
+        cloud_overflow_light_policy = 'archive'
+        cloud_upload_max_per_day = 0
+        cloud_upload_per_cycle = 0
 
     calls = []
 
@@ -240,6 +248,20 @@ def test_archive_fail_cap():
         def _archive_snapshot_to_cloud(self, s, d, e):
             calls.append(s.snapshot_id)
             return False       # 永远失败（模拟云盘不可用）
+
+        def _cloud_uploads_today(self):
+            return 0
+
+        # 2026-11-13 新增的云窗口依赖：本节测的是失败上限，
+        # 固定成"在窗口内、不走 outbox"，行为与改动前一致。
+        def _cfg_int(self, field, default):
+            try:
+                return int(getattr(Cfg, field, default))
+            except Exception:
+                return default
+
+        def _cloud_in_window(self):
+            return True
 
     h = H()
     # 取真实方法
@@ -257,7 +279,9 @@ def test_archive_fail_cap():
         'info': staticmethod(lambda *a, **k: None),
         'warning': staticmethod(lambda *a, **k: None),
         'error': staticmethod(lambda *a, **k: None)}),
-        'Path': Path}
+        'Path': Path,
+        'config_int': _config_int,
+        'datetime': datetime}
     exec(compile(textwrap.dedent(fn), '<m>', 'exec'), ns)
     H._handle_overflow_to_cloud = ns['_handle_overflow_to_cloud']
 
@@ -357,6 +381,64 @@ def test_reconcile_with_disk():
     shutil.rmtree(root, ignore_errors=True)
 
 
+def test_prune_restore_scripts():
+    print()
+    print('=== E. 死恢复脚本清理（2026-11-14）===')
+    from modules.snapshot_manager import SnapshotManager
+
+    root = Path(tempfile.mkdtemp(prefix='zf_rsc_'))
+    snap_dir = root / 'snaps'
+    snap_dir.mkdir()
+
+    class Cfg:
+        deepseek_plugins_dir = str(root / 'plugins')
+        deepseek_exe_path = str(root / 'DeepSeek.exe')
+        snapshot_dir = str(snap_dir)
+        backup_plugins = True
+        backup_plugin_config = True
+        backup_session_data = True
+        backup_keys = False
+
+    (root / 'plugins').mkdir()
+    sm = SnapshotManager(Cfg())
+
+    # 活着的一对：zip + 同名恢复脚本
+    alive = snap_dir / 'snapshot_20260101_000002.zip'
+    with zipfile.ZipFile(alive, 'w') as zf:
+        zf.writestr('a.txt', 'x')
+    alive_cmd = snap_dir / '恢复_snapshot_20260101_000002.cmd'
+    alive_cmd.write_text('echo x', encoding='utf-8')
+
+    # 死脚本：对应的 zip 早被回收了
+    dead_cmd = snap_dir / '恢复_snapshot_20260101_000003.cmd'
+    dead_cmd.write_text('echo x', encoding='utf-8')
+    # 无关文件不该被动
+    notes = snap_dir / 'notes.txt'
+    notes.write_text('x', encoding='utf-8')
+
+    n = sm.prune_orphan_restore_scripts()
+    chk(n == 1, '清掉 1 个死脚本（实删 {}）'.format(n))
+    chk(not dead_cmd.exists(), '指向已删包的脚本没了')
+    chk(alive_cmd.exists() and alive.exists(), '有 zip 的脚本保留')
+    chk(notes.exists(), '无关文件不动')
+    chk(sm.prune_orphan_restore_scripts() == 0, '重复执行幂等')
+
+    # delete_snapshot 要连带删脚本，否则每删一份就留一个空壳
+    class SnapData:
+        def __init__(self, sid, arc):
+            self.snapshot_id = sid
+            self.archive_path = str(arc)
+
+    sm.snapshots['snapshot_20260101_000002'] = SnapData(
+        'snapshot_20260101_000002', alive)
+    ok = sm.delete_snapshot('snapshot_20260101_000002')
+    chk(ok, '删快照返回成功')
+    chk(not alive.exists(), 'zip 已删')
+    chk(not alive_cmd.exists(), '删除快照时连带删掉恢复脚本')
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def test_cleanup_corrupt_archives():
     print()
     print('=== F. 截断包清理（写了一半的快照 zip）===')
@@ -414,6 +496,7 @@ if __name__ == '__main__':
     test_node_modules_exclusion()
     test_prune_missing_entries()
     test_cleanup_staging_dirs()
+    test_prune_restore_scripts()
     test_archive_fail_cap()
     test_reconcile_with_disk()
     test_cleanup_corrupt_archives()

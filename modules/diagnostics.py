@@ -236,6 +236,49 @@ def build_diagnostic_bundle(config, dest_path=None, log_dir=None,
     return dest
 
 
+def _index_entries(root) -> dict:
+    """从 snapshot_index.json 取 {快照id: {is_full, runtime_included, size_mb}}
+
+    索引里 is_full 是创建时写死的权威标记；文件大小会被"跳过运行时"的完整快照骗到。
+    runtime_included 是 2026-11-16 之后新增的字段（P4），老索引没有 → 留 None，
+    交给 snapshot_has_runtime 按体积粗判。
+    读不到索引就返回空 dict，调用方退回按大小粗分。
+    """
+    try:
+        import json as _json
+        idx = _json.loads((root / "snapshot_index.json").read_text(encoding="utf-8"))
+        rows = idx.values() if isinstance(idx, dict) else idx
+        out = {}
+        for r in rows:
+            if isinstance(r, dict) and r.get("snapshot_id"):
+                out[str(r["snapshot_id"])] = {
+                    "is_full": bool(r.get("is_full")),
+                    "runtime_included": r.get("runtime_included"),
+                    "has_session_data": bool(r.get("has_session_data")),
+                    "size_mb": r.get("size_mb"),
+                }
+        return out
+    except Exception:
+        return {}
+
+
+def _classify_index_entry(entry, fallback_mb=0.0) -> bool:
+    """索引条目 → 这份"完整快照"是否真的含运行时（True/False）"""
+    try:
+        from modules.snapshot_manager import snapshot_has_runtime
+    except Exception:                       # pragma: no cover - 包内相对导入
+        from .snapshot_manager import snapshot_has_runtime
+    size = entry.get("size_mb")
+    if size is None:
+        size = fallback_mb
+    probe = {
+        "is_full": bool(entry.get("is_full")),
+        "runtime_included": entry.get("runtime_included"),
+        "size_mb": size,
+    }
+    return snapshot_has_runtime(probe)
+
+
 def retention_reconcile(config, snapshot_dir=None) -> dict:
     """配置里的保留策略 vs 盘上实况（防"配置改了没人知道"的漂移）
 
@@ -247,11 +290,33 @@ def retention_reconcile(config, snapshot_dir=None) -> dict:
         root = _P(snapshot_dir or getattr(config, "snapshot_dir", "") or "")
         files = sorted(root.glob("snapshot_*.zip")) if root.is_dir() else []
         size_gb = round(sum(f.stat().st_size for f in files) / (1024 ** 3), 2) if files else 0.0
-        # 轻量/完整按大小粗分：完整快照含运行时，明显更大
-        sizes = [f.stat().st_size for f in files]
-        median = sorted(sizes)[len(sizes) // 2] if sizes else 0
-        full = [f for f in files if median and f.stat().st_size >= median * 2]
-        light = [f for f in files if f not in full]
+        # 轻量/完整优先按索引里的 is_full 认（权威），索引缺失才退回"按大小粗分"。
+        # 2026-11-12：定时完整快照在运行时没变时会跳过 primary-runtime，体积掉到
+        # 和轻量快照一样（24.5 MB），按大小分会把 12 份完整快照全算成轻量。
+        # 2026-11-16（P4）：再拆一层 —— is_full 但既没运行时也没会话的，按轻量计配额，
+        # 否则每天都报"完整快照超出配置 21/12"，而它们跟轻量包一样大。
+        # 2026-11-16 二次修正：完整快照现在都带会话（~140 MB），这类必须按完整档计。
+        entries = _index_entries(root)
+        full_disk, degraded_full, light = [], [], []
+        if entries:
+            for f in files:
+                e = entries.get(f.stem)
+                if e is None:
+                    light.append(f)
+                    continue
+                if not e.get("is_full"):
+                    light.append(f)
+                elif e.get("has_session_data") or _classify_index_entry(
+                        e, f.stat().st_size / (1024 * 1024)):
+                    full_disk.append(f)
+                else:
+                    degraded_full.append(f)
+        else:
+            sizes = [f.stat().st_size for f in files]
+            median = sorted(sizes)[len(sizes) // 2] if sizes else 0
+            full_disk = [f for f in files if median and f.stat().st_size >= median * 2]
+            light = [f for f in files if f not in full_disk]
+        light_all = light + degraded_full
         cfg = {
             "max_light": config_int(config, 'max_light_snapshots', 0),
             "max_full": config_int(config, 'max_full_snapshots', 0),
@@ -259,22 +324,49 @@ def retention_reconcile(config, snapshot_dir=None) -> dict:
             "full_minutes": config_int(config, 'full_snapshot_interval_minutes', 0),
         }
         notes = []
-        if cfg["max_light"] and len(light) >= cfg["max_light"]:
-            notes.append("轻量快照已达上限 {}/{}".format(len(light), cfg["max_light"]))
-        if cfg["max_full"] and len(full) > cfg["max_full"]:
-            notes.append("完整快照超出配置 {}/{}".format(len(full), cfg["max_full"]))
+        severity = "info"
+        # 宽松档要压到上限的 2 倍才真删，中间那段是留给云归档的窗口；
+        # 所以"到了上限"是正常状态，不该报 WARNING（实测每启动一次刷一条，全是误报）。
+        if cfg["max_light"] and len(light_all) >= cfg["max_light"]:
+            soft = cfg["max_light"] * 2
+            extra = ""
+            if degraded_full:
+                extra = "，其中 {} 份是无运行时无会话的完整快照".format(len(degraded_full))
+            notes.append("轻量口径快照 {}/{}（宽松档 {} 个才真删{}）".format(
+                len(light_all), cfg["max_light"], soft, extra))
+            if len(light_all) > soft:
+                severity = "warning"
+        if cfg["max_full"]:
+            if len(full_disk) > cfg["max_full"]:
+                notes.append("完整快照（含运行时/会话）超出配置 {}/{}".format(
+                    len(full_disk), cfg["max_full"]))
+                severity = "warning"
+            else:
+                notes.append("完整快照（含运行时/会话）{}/{}".format(
+                    len(full_disk), cfg["max_full"]))
         projected_gb = 0.0
-        if light or full:
-            avg_l = sum(f.stat().st_size for f in light) / len(light) if light else 0
-            avg_f = sum(f.stat().st_size for f in full) / len(full) if full else 0
-            projected_gb = round((avg_l * cfg["max_light"] + avg_f * cfg["max_full"]) / (1024 ** 3), 2)
+        if light_all or full_disk:
+            avg_l = sum(f.stat().st_size for f in light_all) / len(light_all) if light_all else 0
+            avg_f = (sum(f.stat().st_size for f in full_disk) / len(full_disk)
+                     if full_disk else 0)
+            # 完整名额按"现在真有几份"估，别拿 12 × 242 MB 去吓自己：
+            # 含运行时的包只在 DSH 升级时产生（full_snapshot_runtime_mode=on_change），
+            # 带会话的完整包则是每份都有（~140 MB），所以这里按实际平均体积 × 实际份数。
+            slots_f = cfg["max_full"]
+            if slots_f and full_disk and len(full_disk) < slots_f:
+                slots_f = len(full_disk)
+            projected_gb = round(
+                (avg_l * cfg["max_light"] + avg_f * slots_f) / (1024 ** 3), 2)
         return {
             "dir": str(root),
             "config": cfg,
-            "disk": {"total": len(files), "light": len(light), "full": len(full),
+            "disk": {"total": len(files), "light": len(light_all),
+                     "full": len(full_disk),
+                     "full_degraded": len(degraded_full),
                      "size_gb": size_gb},
             "steady_state_gb": projected_gb,
             "notes": notes,
+            "severity": severity,
         }
     except Exception as e:
         return {"error": str(e)}

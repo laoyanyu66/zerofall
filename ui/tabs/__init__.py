@@ -10,6 +10,7 @@ from .cloud_tab import CloudTab
 from .settings_tab import SettingsTab
 from .plugin_tab import PluginTab
 from .config_tab import ConfigTab
+from .resume_tab import ResumeTab
 
 __all__ = [
     'DashboardTab',
@@ -19,4 +20,5 @@ __all__ = [
     'SettingsTab',
     'PluginTab',
     'ConfigTab',
+    'ResumeTab',
 ]

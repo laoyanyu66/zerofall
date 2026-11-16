@@ -216,6 +216,21 @@ def main():
     fix = result.get('fix') or {}
     print('  修复结果: ok={} stop={}'.format(
         fix.get('ok'), str(fix.get('stop_reason') or '')[:40]))
+
+    # 上游模型这一轮没给出有效回答时，后面「修复成功 / 源码变化 / 空列表保护 /
+    # 打包 / 发布 / applied 回执」整串都会连带 FAIL，看着像 10 处回归，其实只有
+    # 一个环境原因。判 SKIP（退出码 0，输出明写 SKIP，不算 PASS）。
+    # 前提是前两步的本地检查全过 —— 那才是真回归，不能被 SKIP 掩盖。
+    UPSTREAM_KINDS = {'timeout', 'unavailable', 'ratelimit', 'balance',
+                      'auth', 'forbidden', 'region', 'deprecated'}
+    _kind = str(fix.get('kind') or '')
+    if not fix.get('ok') and _kind in UPSTREAM_KINDS and not FAIL:
+        print()
+        print('  [SKIP] 上游模型不可用（{}）'.format(_kind))
+        print('  error: {}'.format(fix.get('error') or '-'))
+        print('  hint : {}'.format(fix.get('hint') or '-'))
+        return finish(sand, srv, time.time() - total_t0, verdict='SKIP')
+
     chk(fix.get('ok') is True, 'ACP 修复成功')
 
     # ═══ 4. 源码真的被改了吗 ═══
@@ -292,7 +307,7 @@ def main():
     return finish(sand, srv, time.time() - total_t0)
 
 
-def finish(sand, srv, elapsed=None):
+def finish(sand, srv, elapsed=None, verdict=None):
     print()
     print('=== 清理 ===')
     try:
@@ -313,6 +328,12 @@ def finish(sand, srv, elapsed=None):
     print('通过 {} / {} 项'.format(len(PASS), len(PASS) + len(FAIL)))
     for f in FAIL:
         print('  - ' + f)
+    # verdict 用来把"上游模型不可用"标成 SKIP：那不是代码回归，
+    # 只是这一轮没拿到模型回答，后面整串检查都会连带 FAIL。
+    if verdict == 'SKIP':
+        print()
+        print('=== 判定: SKIP 上游模型不可用，本轮无法验证端到端链路 ===')
+        return 0
     return 0 if not FAIL else 1
 
 

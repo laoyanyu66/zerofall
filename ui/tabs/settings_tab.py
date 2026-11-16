@@ -90,6 +90,17 @@ class SettingsTab(QWidget):
         interval_row.addWidget(self.max_snap_spin)
         interval_row.addStretch()
         backup_layout.addLayout(interval_row, 2, 1)
+
+        # 内容没变就不重复拍（2026-11-12）：静默快照 10 分钟一份、每份 42 MB 目录
+        # + 24.5 MB 压缩，插件/配置多数时间根本没动，反复拍同一份纯烧磁盘。
+        self.skip_unchanged_check = QCheckBox("内容没变就不重复拍（插件和配置指纹相同则跳过）")
+        self.skip_unchanged_check.setChecked(
+            bool(getattr(self.config, 'silent_snapshot_skip_unchanged', True)))
+        self.skip_unchanged_check.setToolTip(
+            "指纹和变更检测用的是同一套。手动「快速快照」不受影响；\n"
+            "另外还有兜底：没变也至少每 {} 小时拍一份。".format(
+                config_int(self.config, 'silent_snapshot_max_gap_hours', 6)))
+        backup_layout.addWidget(self.skip_unchanged_check, 3, 0, 1, 2)
         
         self.drift_check = QCheckBox("检测到插件/配置变更时自动创建快照")
         self.drift_check.setChecked(
@@ -200,13 +211,155 @@ class SettingsTab(QWidget):
         cloud_row.addStretch()
         cloud_layout.addLayout(cloud_row, 2, 1)
         
-        cloud_hint = QLabel("提示：需保持百度网盘客户端运行，文件才会自动上传到云端")
+        cloud_hint = QLabel(
+            "提示：窗口模式下只需在窗口内保持百度网盘在线，其余时间可以不打开")
         cloud_hint.setStyleSheet("color: #888; font-size: 11px;")
         cloud_layout.addWidget(cloud_hint, 3, 0, 1, 2)
         
         self.cloud_encrypt_check = QCheckBox("上传前 AES 加密（恢复时需用 ZeroFall 解密）")
         self.cloud_encrypt_check.setChecked(getattr(self.config, "cloud_sync_encrypt", False))
         cloud_layout.addWidget(self.cloud_encrypt_check, 4, 0, 1, 2)
+
+        # ── 网盘压力（2026-11-12）──
+        # 百度网盘开着同步时，一天几十个大包会把 BaiduNetdisk* 的常驻内存顶到 2 GB。
+        # 这两项就是给同步进程踩刹车用的。
+        pressure_row = QHBoxLayout()
+        pressure_row.addWidget(QLabel("轻量快照溢出时:"))
+        self.cloud_light_policy_combo = QComboBox()
+        self.cloud_light_policy_combo.addItem("直接删本地（省网盘带宽和内存）", "delete")
+        self.cloud_light_policy_combo.addItem("逐个加密上传（保留 10 分钟粒度云端历史）", "archive")
+        _pol = str(getattr(self.config, 'cloud_overflow_light_policy', 'delete') or 'delete')
+        _idx = self.cloud_light_policy_combo.findData(_pol)
+        self.cloud_light_policy_combo.setCurrentIndex(_idx if _idx >= 0 else 0)
+        self.cloud_light_policy_combo.setToolTip(
+            "云端完整快照已经覆盖同一时间窗（30 分钟一个），\n"
+            "轻量快照再逐个上传属于重复传输 —— 实测一天多塞 90 个文件 / 1.2 GB。")
+        pressure_row.addWidget(self.cloud_light_policy_combo)
+        pressure_row.addStretch()
+        cloud_layout.addLayout(pressure_row, 5, 0, 1, 2)
+
+        cap_row = QHBoxLayout()
+        cap_row.addWidget(QLabel("每日上传上限:"))
+        self.cloud_upload_cap_spin = QSpinBox()
+        self.cloud_upload_cap_spin.setRange(0, 500)
+        self.cloud_upload_cap_spin.setSuffix(" 个/天")
+        self.cloud_upload_cap_spin.setMaximumWidth(140)
+        self.cloud_upload_cap_spin.setValue(
+            config_int(self.config, 'cloud_upload_max_per_day', 24))
+        self.cloud_upload_cap_spin.setToolTip(
+            "超过上限就不传了，快照留在本地等第二天再补。0 = 不限。")
+        cap_row.addWidget(self.cloud_upload_cap_spin)
+        cap_row.addStretch()
+        cloud_layout.addLayout(cap_row, 6, 0, 1, 2)
+
+        # ── 云窗口（2026-11-13）──
+        # 实测 12 个 BaiduNetdisk* 进程占 1.99 GB。同步盘方案只要把写入集中到
+        # 一小段时间，客户端就只需要在那段时间在线，其余时间可以把内存还回去。
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("网盘客户端:"))
+        self.cloud_client_mode_combo = QComboBox()
+        self.cloud_client_mode_combo.addItem("只在同步窗口在线（省内存）", "windowed")
+        self.cloud_client_mode_combo.addItem("一直在线（老行为）", "always")
+        self.cloud_client_mode_combo.addItem("不自动开关（自己控制）", "manual")
+        _cmode = str(getattr(self.config, 'cloud_client_mode', 'windowed') or 'windowed')
+        _ci = self.cloud_client_mode_combo.findData(_cmode)
+        self.cloud_client_mode_combo.setCurrentIndex(_ci if _ci >= 0 else 0)
+        self.cloud_client_mode_combo.setToolTip(
+            "只在同步窗口在线：每天只在那段时间写同步盘，窗口内由 ZeroFall 拉起客户端，\n"
+            "窗口结束后自动关掉（推荐）。\n"
+            "一直在线：老行为，客户端必须常驻。\n"
+            "不自动开关：照常写同步盘，但 ZeroFall 不碰客户端。")
+        mode_row.addWidget(self.cloud_client_mode_combo)
+        mode_row.addStretch()
+        cloud_layout.addLayout(mode_row, 7, 0, 1, 2)
+
+        # ── 窗口时机（2026-11-14）──
+        # 定点 03:30 只适合常开机的机器。开机时间不固定 / 有时整天不开机的话，
+        # 定点窗口多数日子根本跑不到，所以默认改成"开机后看空闲再开窗"。
+        cadence_row = QHBoxLayout()
+        cadence_row.addWidget(QLabel("同步频率:"))
+        self.cloud_cadence_combo = QComboBox()
+        self.cloud_cadence_combo.addItem("每天一次", 1)
+        self.cloud_cadence_combo.addItem("每 2 天", 2)
+        self.cloud_cadence_combo.addItem("每 3 天", 3)
+        self.cloud_cadence_combo.addItem("每 7 天", 7)
+        self.cloud_cadence_combo.addItem("不设频率（按 20 小时间隔）", 0)
+        _cad = config_int(self.config, 'cloud_sync_cadence_days', 1)
+        _cadi = self.cloud_cadence_combo.findData(_cad)
+        self.cloud_cadence_combo.setCurrentIndex(_cadi if _cadi >= 0 else 0)
+        self.cloud_cadence_combo.setToolTip(
+            "多久把积压的快照传一次云。频率越长，网盘客户端出现的次数越少、占内存越少。\n"
+            "暂存区会按天去重（每天只留 1 个轻量 + 1 个完整），所以拉长频率不会弄丢恢复点，\n"
+            "也不会让本地暂存无限涨。")
+        cadence_row.addWidget(self.cloud_cadence_combo)
+        cadence_row.addStretch()
+        cloud_layout.addLayout(cadence_row, 8, 0, 1, 2)
+
+        trigger_row = QHBoxLayout()
+        trigger_row.addWidget(QLabel("窗口时机:"))
+        self.cloud_window_trigger_combo = QComboBox()
+        self.cloud_window_trigger_combo.addItem("看机会开（推荐）", "auto")
+        self.cloud_window_trigger_combo.addItem("每天固定时间", "fixed")
+        _trig = str(getattr(self.config, 'cloud_window_trigger', 'auto') or 'auto')
+        _ti = self.cloud_window_trigger_combo.findData(_trig)
+        self.cloud_window_trigger_combo.setCurrentIndex(_ti if _ti >= 0 else 0)
+        self.cloud_window_trigger_combo.setToolTip(
+            "看机会开：程序启动后先等一会儿，键鼠空闲够久、而且确实有包要传时才开窗口；\n"
+            "两次窗口至少隔 20 小时，36 小时没传过会硬来一次。适合开机时间不固定的机器。\n"
+            "每天固定时间：老行为，到点才开（适合 24 小时开机的机器）。")
+        trigger_row.addWidget(self.cloud_window_trigger_combo)
+        trigger_row.addWidget(QLabel("  空闲"))
+        self.cloud_window_idle_spin = QSpinBox()
+        self.cloud_window_idle_spin.setRange(1, 120)
+        self.cloud_window_idle_spin.setSuffix(" 分钟")
+        self.cloud_window_idle_spin.setMaximumWidth(110)
+        self.cloud_window_idle_spin.setValue(
+            config_int(self.config, 'cloud_window_idle_minutes', 5))
+        self.cloud_window_idle_spin.setToolTip(
+            "键鼠空闲多久才算「人不在」，这时才拉网盘客户端占内存。")
+        trigger_row.addWidget(self.cloud_window_idle_spin)
+        trigger_row.addStretch()
+        cloud_layout.addLayout(trigger_row, 9, 0, 1, 2)
+
+        window_row = QHBoxLayout()
+        window_row.addWidget(QLabel("固定窗口:"))
+        self.cloud_window_start_edit = QLineEdit(
+            str(getattr(self.config, 'cloud_window_start', '03:30') or '03:30'))
+        self.cloud_window_start_edit.setMaximumWidth(70)
+        self.cloud_window_start_edit.setPlaceholderText("03:30")
+        self.cloud_window_start_edit.setToolTip("窗口开始时间（HH:MM，可跨午夜）；只在「每天固定时间」时生效")
+        window_row.addWidget(self.cloud_window_start_edit)
+        self.cloud_window_span_spin = QSpinBox()
+        self.cloud_window_span_spin.setRange(10, 720)
+        self.cloud_window_span_spin.setSuffix(" 分钟")
+        self.cloud_window_span_spin.setMaximumWidth(120)
+        self.cloud_window_span_spin.setValue(
+            config_int(self.config, 'cloud_window_minutes', 60))
+        self.cloud_window_span_spin.setToolTip("一轮窗口最长持续多久（队列传完会提前收尾）")
+        window_row.addWidget(self.cloud_window_span_spin)
+        self.cloud_window_autoclose_check = QCheckBox("窗口结束自动关闭网盘")
+        self.cloud_window_autoclose_check.setChecked(
+            bool(getattr(self.config, 'cloud_window_auto_close', True)))
+        self.cloud_window_autoclose_check.setToolTip(
+            "只关 ZeroFall 自己拉起来的客户端；你手动开着网盘时不会动它。")
+        window_row.addWidget(self.cloud_window_autoclose_check)
+        window_row.addStretch()
+        cloud_layout.addLayout(window_row, 10, 0, 1, 2)
+
+        outbox_row = QHBoxLayout()
+        outbox_row.addWidget(QLabel("窗口外暂存上限:"))
+        self.cloud_outbox_spin = QSpinBox()
+        self.cloud_outbox_spin.setRange(0, 40)
+        self.cloud_outbox_spin.setSuffix(" 个包")
+        self.cloud_outbox_spin.setMaximumWidth(120)
+        self.cloud_outbox_spin.setValue(
+            config_int(self.config, 'cloud_outbox_max', 6))
+        self.cloud_outbox_spin.setToolTip(
+            "窗口外先加密暂存在本地 outbox，等窗口打开一次性搬进同步盘。\n"
+            "每个包约 30 MB。填 0 = 不暂存（不推荐，完整快照会顶到本地硬上限被删）。")
+        outbox_row.addWidget(self.cloud_outbox_spin)
+        outbox_row.addStretch()
+        cloud_layout.addLayout(outbox_row, 11, 0, 1, 2)
         
         cloud_group.setLayout(cloud_layout)
         layout.addWidget(cloud_group)
@@ -338,6 +491,44 @@ class SettingsTab(QWidget):
         ab.addWidget(self.auto_update_check, 2, 0, 1, 4)
         self.agent_box.setLayout(ab)
         ctl_outer.addWidget(self.agent_box)
+
+        # ── 本地更新通道（standalone 也能自换版）──
+        su_box = QGroupBox("自动换版（本地更新通道）")
+        su = QGridLayout()
+        self.su_enabled_check = QCheckBox("启用：更新目录里出现新包就自动换版并重启")
+        self.su_enabled_check.setChecked(
+            getattr(self.config, 'self_update_enabled', True))
+        self.su_enabled_check.setToolTip(
+            "把 UpdatePackage 格式的 zip 丢进更新目录即可，程序自己替换 exe 并重启。\n"
+            "替换由提权的子进程完成，不会再弹 UAC —— 以后发版不用你手动换版。")
+        su.addWidget(self.su_enabled_check, 0, 0, 1, 4)
+
+        self.su_dir_edit = QLineEdit(getattr(self.config, 'self_update_dir', ''))
+        self.su_dir_edit.setPlaceholderText(r"留空 = <安装目录>\updates")
+        su.addWidget(QLabel("更新目录:"), 1, 0)
+        su.addWidget(self.su_dir_edit, 1, 1, 1, 3)
+
+        self.su_interval_spin = QSpinBox()
+        self.su_interval_spin.setRange(5, 1440)
+        self.su_interval_spin.setSuffix(" 分钟")
+        self.su_interval_spin.setValue(
+            config_int(self.config, 'self_update_interval_minutes', 30))
+        su.addWidget(QLabel("检查间隔:"), 2, 0)
+        su.addWidget(self.su_interval_spin, 2, 1)
+
+        self.su_idle_check = QCheckBox("仅键鼠空闲")
+        self.su_idle_check.setChecked(
+            getattr(self.config, 'self_update_require_idle', True))
+        self.su_idle_check.setToolTip("空闲后才换版，避免正在用 DSH 时被重启打断")
+        su.addWidget(self.su_idle_check, 2, 2)
+        self.su_idle_spin = QSpinBox()
+        self.su_idle_spin.setRange(0, 120)
+        self.su_idle_spin.setSuffix(" 分钟")
+        self.su_idle_spin.setValue(
+            config_int(self.config, 'self_update_idle_minutes', 3))
+        su.addWidget(self.su_idle_spin, 2, 3)
+        su_box.setLayout(su)
+        ctl_outer.addWidget(su_box)
         
         # ── 传输通道（两边都需要）──
         chan_box = QGroupBox("传输通道")
@@ -522,6 +713,22 @@ class SettingsTab(QWidget):
         self.auto_rollback_check = QCheckBox("DeepSeek 崩溃后自动回退最新健康快照并重启")
         self.auto_rollback_check.setChecked(getattr(self.config, "auto_rollback_on_crash", True))
         behavior_layout.addWidget(self.auto_rollback_check, 1, 0, 1, 2)
+
+        # 崩溃「保留现场」（不回退）后，把现场交给豆包：不带上下文地人工排查太慢，
+        # 这里做本机 GUI 接力（拉起 → 新对话 → 粘贴提示词 → 回车），失败退化成剪贴板。
+        self.doubao_relay_check = QCheckBox(
+            "保留现场时自动拉起豆包并发送「dsh 又崩溃了，帮我分析原因并修复」")
+        self.doubao_relay_check.setChecked(getattr(self.config, "doubao_relay_on_crash", True))
+        self.doubao_relay_check.setToolTip(
+            "只在「不回退快照、保留现场」的路径上触发。\n"
+            "流程：启动豆包 → Ctrl+N 新对话 → 粘贴崩溃现场（退出码、崩溃日志路径）→ 回车。\n"
+            "任何一步失败都会把提示词留在剪贴板，手动 Ctrl+V 即可。")
+        behavior_layout.addWidget(self.doubao_relay_check, 3, 0, 1, 2)
+
+        behavior_layout.addWidget(QLabel("豆包路径:"), 4, 0)
+        self.doubao_exe_edit = QLineEdit(getattr(self.config, "doubao_exe", "") or "")
+        self.doubao_exe_edit.setPlaceholderText("留空自动查找（D:\\Doubao\\app\\Doubao.exe / 开始菜单）")
+        behavior_layout.addWidget(self.doubao_exe_edit, 4, 1, 1, 2)
         
         # 崩溃恢复倒计时：默认 10 分钟。崩溃时人常不在电脑前，
         # 60 秒太短，还没看清是哪个快照就被自动恢复了。
@@ -691,6 +898,8 @@ class SettingsTab(QWidget):
         self.config.auto_launch_deepseek = self.auto_launch_check.isChecked()
         self.config.auto_exit_after_deepseek_close = self.auto_exit_check.isChecked()
         self.config.auto_rollback_on_crash = self.auto_rollback_check.isChecked()
+        self.config.doubao_relay_on_crash = self.doubao_relay_check.isChecked()
+        self.config.doubao_exe = self.doubao_exe_edit.text().strip()
         # 关闭按钮行为（ask / minimize / exit）
         try:
             _ca = self.close_action_combo.currentData()
@@ -704,6 +913,7 @@ class SettingsTab(QWidget):
             self.config.crash_restore_countdown = 600
         
         self.config.silent_snapshot_interval_minutes = self.interval_spin.value()
+        self.config.silent_snapshot_skip_unchanged = self.skip_unchanged_check.isChecked()
         self.config.plugin_drift_snapshot = self.drift_check.isChecked()
         self.config.max_light_snapshots = self.max_snap_spin.value()
         try:
@@ -721,6 +931,21 @@ class SettingsTab(QWidget):
         self.config.cloud_sync_interval_minutes = self.cloud_interval_spin.value()
         self.config.cloud_history_keep_days = self.cloud_history_spin.value()
         self.config.cloud_sync_encrypt = self.cloud_encrypt_check.isChecked()
+        self.config.cloud_overflow_light_policy = (
+            self.cloud_light_policy_combo.currentData() or 'delete')
+        self.config.cloud_upload_max_per_day = self.cloud_upload_cap_spin.value()
+        self.config.cloud_client_mode = (
+            self.cloud_client_mode_combo.currentData() or 'windowed')
+        self.config.cloud_sync_cadence_days = int(
+            self.cloud_cadence_combo.currentData() or 0)
+        self.config.cloud_window_trigger = (
+            self.cloud_window_trigger_combo.currentData() or 'auto')
+        self.config.cloud_window_idle_minutes = self.cloud_window_idle_spin.value()
+        self.config.cloud_window_start = (
+            self.cloud_window_start_edit.text().strip() or '03:30')
+        self.config.cloud_window_minutes = self.cloud_window_span_spin.value()
+        self.config.cloud_window_auto_close = self.cloud_window_autoclose_check.isChecked()
+        self.config.cloud_outbox_max = self.cloud_outbox_spin.value()
         
         # 主控 / 子控
         _idx = self.role_combo.currentIndex()
@@ -736,6 +961,11 @@ class SettingsTab(QWidget):
         self.config.auto_apply_update = self.auto_update_check.isChecked()
         self.config.auto_fix_enabled = self.auto_fix_check.isChecked()
         self.config.master_self_update = self.self_update_check.isChecked()
+        self.config.self_update_enabled = self.su_enabled_check.isChecked()
+        self.config.self_update_dir = self.su_dir_edit.text().strip()
+        self.config.self_update_interval_minutes = int(self.su_interval_spin.value())
+        self.config.self_update_require_idle = self.su_idle_check.isChecked()
+        self.config.self_update_idle_minutes = int(self.su_idle_spin.value())
         self.config.http_server_enabled = self.http_server_check.isChecked()
         self.config.http_port = int(self.http_port_spin.value())
         self.config.http_token = self.http_token_edit.text().strip()

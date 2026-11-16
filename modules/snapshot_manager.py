@@ -1,13 +1,14 @@
 """
 ZeroFall 快照管理核心模块
 """
+import hashlib
 import json
 import os
 import time
 import shutil
 import zipfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from enum import Enum
@@ -21,6 +22,11 @@ from utils import (
     copy_directory, create_archive, extract_archive, compare_directories,
     generate_snapshot_id, format_timestamp
 )
+
+try:                      # 源码运行：项目根在 sys.path 上
+    from modules import volatile_rules
+except Exception:         # pragma: no cover - 包内相对导入
+    from . import volatile_rules
 
 # 快照排除规则：这些目录/文件不纳入快照
 # 目标：只保留"环境本身"（插件/配置/会话/预设），排除可重建的运行时、依赖、缓存、日志
@@ -74,6 +80,65 @@ def _is_skippable_dir(name: str) -> bool:
     return any(low.startswith(p) for p in _SKIP_DIR_PREFIXES)
 
 
+# ── 内容去重（2026-11-16） ──
+# 实测：快照里三份 dsh-rea-plugin-9.9.9.tgz 二进制完全相同（MD5 D3A12DB579D8，
+# 各 2,463,028 B），分别放在 desktop / zf-acp / zf-fixer 三个 profile 下。
+# tgz 本身已压缩、zip 再压不动，等于每份快照白背 7.05 MB —— 占包体 27.1%。
+# 现在按 (大小, sha256) 去重，相同内容只存一份，另建清单；
+# 恢复时在解压后把缺的副本补回去，后续 _prune/_restore_dir_clean 看到的仍是完整的树。
+#
+# 阈值从 256 KB 降到 4 KB（二次自检）：256 KB 只挡住了"大块头"，而包里还有
+# 483 个文件 / 10.11 MB 是完全相同的小文件（settings.yaml.bak 系、.zf-config-history
+# 快照、_archive 里的重复 md、vendor 脚本副本……）。全量扫下来：
+#   原始 47.94 → 37.90 MB，zip 20.09 → 15.45 MB，去重命中 30 → 513 个，
+#   打包耗时 4.5s → 4.3s（小文件算 sha256 比整份复制还便宜，所以不亏）。
+# 4 KB 以下仍然直接复制：清单条目本身的成本会超过省下的体积。
+# 安全性不变：只有 (size, sha256) 完全相同才省，且恢复时一律先 materialize_dedup() 补回。
+DEDUPE_MIN_BYTES = 4 * 1024        # 2026-11-16 二次自检：256 KB → 4 KB
+DEDUPE_MANIFEST_NAME = "_zf_dedup.json"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def materialize_dedup(snapshot_dir: Path) -> int:
+    """把去重清单里省掉的副本补回去（恢复流程用）
+
+    Returns: 补齐的文件个数
+    """
+    snapshot_dir = Path(snapshot_dir)
+    manifest = snapshot_dir / DEDUPE_MANIFEST_NAME
+    if not manifest.exists():
+        return 0
+    try:
+        data = json.loads(manifest.read_text(encoding='utf-8'))
+        entries = data.get('entries') or {}
+    except Exception as e:
+        ZeroFallLogger.warning("去重清单读取失败（按原样恢复）: {}".format(e))
+        return 0
+
+    restored = 0
+    for rel_target, rel_source in entries.items():
+        target = snapshot_dir / rel_target
+        source = snapshot_dir / rel_source
+        if target.exists() or not source.exists():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(source), str(target))
+            restored += 1
+        except Exception as e:
+            ZeroFallLogger.warning("去重副本补齐失败 {}: {}".format(rel_target, e))
+    if restored:
+        ZeroFallLogger.info("去重复本已补齐 {} 个".format(restored))
+    return restored
+
+
 def copy_for_snapshot(src: Path, dst: Path, include_runtime: bool = False) -> dict:
     """按快照规则复制目录，返回统计信息
     
@@ -81,7 +146,8 @@ def copy_for_snapshot(src: Path, dst: Path, include_runtime: bool = False) -> di
         include_runtime: True 时把 primary-runtime / dsh-runtimes 也纳入
                          （用于"完整快照"，体积约 530 MB，适合离线归档）
     """
-    stats = {"copied": 0, "skipped_dirs": 0, "skipped_files": 0, "bytes": 0}
+    stats = {"copied": 0, "skipped_dirs": 0, "skipped_files": 0, "bytes": 0,
+             "deduped": 0, "dedup_bytes": 0}
     src = Path(src)
     dst = Path(dst)
     if not src.exists():
@@ -108,6 +174,9 @@ def copy_for_snapshot(src: Path, dst: Path, include_runtime: bool = False) -> di
     if not include_runtime:
         global_dirs.add("primary-runtime")   # 轻量快照也排除程序运行时
 
+    seen = {}    # (size, sha256) -> 已存储的相对路径
+    dedup = {}   # 省略的相对路径 -> 实际存储的相对路径
+
     for root, dirs, files in os.walk(src):
         root_p = Path(root)
         try:
@@ -126,6 +195,18 @@ def copy_for_snapshot(src: Path, dst: Path, include_runtime: bool = False) -> di
             if NODE_MODULES_EXCLUDE and d == "node_modules":
                 stats["skipped_dirs"] += 1
                 continue
+            # 运行时垃圾目录（浏览器转储 / 轮转日志），见 volatile_rules
+            if volatile_rules.is_snapshot_junk_dir(d):
+                stats["skipped_dirs"] += 1
+                continue
+            if volatile_rules.is_snapshot_junk_rel((rel / d).as_posix() + '/'):
+                stats["skipped_dirs"] += 1
+                continue
+            # 浏览器 profile 内部的缓存/历史（只在 *-profile 目录内生效）
+            if volatile_rules.is_snapshot_junk_in_browser_profile(
+                    (rel / d).as_posix(), is_dir=True):
+                stats["skipped_dirs"] += 1
+                continue
             kept.append(d)
         dirs[:] = kept
 
@@ -139,14 +220,153 @@ def copy_for_snapshot(src: Path, dst: Path, include_runtime: bool = False) -> di
             if Path(f).suffix.lower() in SNAPSHOT_EXCLUDE_EXTS:
                 stats["skipped_files"] += 1
                 continue
+            if volatile_rules.is_snapshot_junk_file(f):
+                stats["skipped_files"] += 1
+                continue
+            rel_file = (rel / f).as_posix()
+            if volatile_rules.is_snapshot_junk_rel(rel_file):
+                stats["skipped_files"] += 1
+                continue
+            if volatile_rules.is_snapshot_junk_in_browser_profile(rel_file):
+                stats["skipped_files"] += 1
+                continue
+
+            src_file = root_p / f
+            # 内容去重：同内容只存第一份，其余记进清单由恢复流程补回。
+            # 只有"确实写进目标目录之后"才登记为已存，否则复制失败会让后面的副本
+            # 指向一个不存在的文件 —— 恢复时补不回来，等于静默丢文件。
+            size = -1
             try:
-                shutil.copy2(root_p / f, target_dir / f)
+                size = src_file.stat().st_size
+            except Exception:
+                pass
+            key = None
+            if size >= DEDUPE_MIN_BYTES:
+                try:
+                    key = (size, _sha256_file(src_file))
+                except Exception:
+                    key = None
+                stored = seen.get(key) if key else None
+                if stored:
+                    dedup[rel_file] = stored
+                    stats["deduped"] += 1
+                    stats["dedup_bytes"] += size
+                    continue
+
+            try:
+                shutil.copy2(src_file, target_dir / f)
                 stats["copied"] += 1
-                stats["bytes"] += (root_p / f).stat().st_size
+                stats["bytes"] += max(size, 0) if size >= 0 else src_file.stat().st_size
+                if key and key not in seen:
+                    seen[key] = rel_file
             except Exception:
                 stats["skipped_files"] += 1
 
+    if dedup:
+        try:
+            (Path(dst) / DEDUPE_MANIFEST_NAME).write_text(
+                json.dumps({"version": 1, "entries": dedup},
+                           ensure_ascii=False, indent=1),
+                encoding='utf-8')
+        except Exception as e:      # 清单写不出来就别省了，宁可包大也不能丢文件
+            ZeroFallLogger.warning(
+                "去重清单写入失败，改为完整复制 {} 个文件: {}".format(len(dedup), e))
+            for rel_target, rel_source in dedup.items():
+                try:
+                    src_file = Path(src) / rel_target
+                    dst_file = Path(dst) / rel_target
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src_file), str(dst_file))
+                    stats["copied"] += 1
+                    stats["deduped"] -= 1
+                    stats["bytes"] += src_file.stat().st_size
+                except Exception:
+                    pass
+            dedup = {}
+
     return stats
+
+RUNTIME_FULL_MIN_MB = 100.0
+
+
+def _snap_field(snap, name, default=None):
+    """同时吃 SnapshotData 和索引里的 dict（diagnostics 用 dict 探针）"""
+    if isinstance(snap, dict):
+        return snap.get(name, default)
+    return getattr(snap, name, default)
+
+
+def snapshot_has_runtime(snap) -> bool:
+    """这份 is_full 快照里到底带没带 primary-runtime（2026-11-16 / P4）
+
+    背景：``_full_snapshot_needs_runtime()`` 在 DSH 运行时没变时会跳过
+    primary-runtime 省盘，但快照照旧标 is_full=True。于是索引里 21 份"完整"
+    只有一两份真的含运行时，其余每份 20-80 MB（去重后约 20 MB），却都去挤
+    max_full_snapshots 那 12 个名额 —— 保留策略每天报"完整快照超出配置 21/12"，
+    云端也因此被塞进一堆"完整"名义下的轻量包。
+
+    判据顺序（宁可判成"含运行时"，别把真完整包当轻量删了）：
+      1. 新建快照写死的 runtime_included（权威）
+      2. 老索引没有该字段 → 按体积粗判：含运行时的包 165-242 MB，
+         跳过的 20-80 MB，100 MB 是两者之间的明显分界
+      3. 连体积都读不到 → 当作真完整（行为与改动前一致）
+
+    注意：第 2 条只是"包不在手上时的兜底"。线上实测发现 P1/P3 之后连真完整的包
+    也只有 ~79 MB，100 MB 这条界线已经不成立，所以启动清理会先用
+    ``backfill_runtime_included()`` 开包看真相、把结论写回索引，兜底仅在包缺失时生效。
+    """
+    if not bool(_snap_field(snap, 'is_full', False)):
+        return False
+    flag = _snap_field(snap, 'runtime_included', None)
+    if flag is not None:
+        return bool(flag)
+    try:
+        size = float(_snap_field(snap, 'size_mb', 0))
+    except (TypeError, ValueError):
+        size = 0.0
+    if size <= 0:
+        return True
+    return size >= RUNTIME_FULL_MIN_MB
+
+
+def snapshot_has_sessions(snap) -> bool:
+    """这份快照里带没带会话数据（看索引字段 has_session_data）
+
+    2026-11-16 二次修正后"每份完整快照都带会话"，这些包 ~140 MB，
+    云端必须按大包处理（独占一轮窗口），否则同批轻量包会被挤到下一轮。
+    """
+    return bool(_snap_field(snap, 'has_session_data', False))
+
+
+def snapshot_is_full_grade(snap) -> bool:
+    """属于"大包"档：含运行时，或者带会话
+
+    保留策略用它分档（吃 max_full），云端用它决定要不要独占窗口。
+    既不含运行时也不带会话的"完整快照"（老口径 20-80 MB）仍按轻量档走。
+    """
+    return snapshot_has_runtime(snap) or snapshot_has_sessions(snap)
+
+
+def pick_runtime_full_for_cloud(snaps, keep: int = 1):
+    """云端允许参与常规归档的"大包"（含运行时 / 带会话），只留最新 keep 份
+
+    含运行时的完整包 165-434 MB、带会话的完整包 ~140 MB，一个就能把 60 分钟的
+    同步窗口占满，同一批的轻量包全被挤到下一轮。所以云端只保留最新 N 份（默认 1），
+    更老的靠 cloud_history_keep_days 退休，不参与每轮抽样。
+
+    2026-11-16 二次修正：加了"带会话"这一档 —— 每份完整快照都带会话后，
+    它们虽然不含运行时也有 ~140 MB，照样会把窗口吃满。
+    """
+    try:
+        keep = int(keep)
+    except (TypeError, ValueError):
+        keep = 1
+    heavy = [s for s in snaps if snapshot_is_full_grade(s)]
+    heavy.sort(key=lambda s: str(_snap_field(s, 'created_at', '')))
+    if keep <= 0:
+        return []
+    return heavy[-keep:]
+
 
 def _int_opt(value, default):
     """把配置值转 int，坏值才退回默认。
@@ -178,16 +398,23 @@ def plan_retention(snapshots, max_light, max_full,
       · protected_ids    —— 调用方显式点名的（崩溃恢复目标、正在恢复的链）
 
     max_* <= 0 表示该类不设上限（0 不解释成"全部删掉"）。
+
+    配额按**实际内容**分档（2026-11-16 / P4，二次修正加了会话档）：
+      · 含运行时的完整快照（165-434 MB）→ 吃 max_full
+      · 带会话的完整快照（~140 MB）→ 也吃 max_full
+      · 既没运行时也没会话的"完整快照"（20-80 MB，运行时没变时省的盘）→ 吃 max_light
+      改前两档都按 is_full 分，于是 21 份 20 MB 的"完整"挤 12 个名额，
+      每天报一次"完整快照超出配置 21/12"，而它们跟轻量包其实一样大。
     """
     protected = set(protected_ids or ())
     max_light = _int_opt(max_light, 0)
     max_full = _int_opt(max_full, 0)
     healthy = [s for s in snapshots.values() if s.status == SnapshotStatus.HEALTHY]
+    full_grades = [s for s in healthy if snapshot_is_full_grade(s)]
+    light_like = [s for s in healthy if not snapshot_is_full_grade(s)]
     groups = (
-        (sorted([s for s in healthy if not getattr(s, 'is_full', False)],
-                key=lambda s: s.created_at), max_light, keep_newest_light),
-        (sorted([s for s in healthy if getattr(s, 'is_full', False)],
-                key=lambda s: s.created_at), max_full, keep_newest_full),
+        (sorted(light_like, key=lambda s: s.created_at), max_light, keep_newest_light),
+        (sorted(full_grades, key=lambda s: s.created_at), max_full, keep_newest_full),
     )
     doomed = []
     for group, limit, keep_newest in groups:
@@ -244,6 +471,9 @@ class SnapshotData:
     has_keys: bool = False
     archive_path: str = ""
     is_full: bool = False       # True = 完整快照（含运行时），不参与自动清理
+    # is_full=True 但运行时没变时，包里其实没有 primary-runtime（省盘），
+    # 这份按轻量计配额。None = 老索引没有这个字段，由 snapshot_has_runtime 粗判。
+    runtime_included: Optional[bool] = None
     
     def to_dict(self) -> Dict:
         """转换为字典"""
@@ -457,6 +687,7 @@ class SnapshotManager:
                         result["skipped"].append(sid)      # 可能正在写
                         continue
                     is_full = False
+                    has_runtime = False
                     try:
                         with zipfile.ZipFile(zf_path) as zf:
                             for n in zf.namelist():
@@ -464,9 +695,14 @@ class SnapshotManager:
                                 # 不是以 primary-runtime 开头。原判据用 startswith
                                 # 永远匹配不到，会把孤儿完整快照误登记成轻量，
                                 # 进而被当作轻量按 48 个上限清理掉。
-                                if ('primary-runtime' in n.split('/')):
+                                if 'primary-runtime' in n.split('/'):
                                     is_full = True
+                                    has_runtime = True
                                     break
+                                if n.rsplit('/', 1)[-1] == '.zf_full':
+                                    # 只带 .zf_full 标记、没有 primary-runtime：
+                                    # 这是"运行时没变、跳过运行时"的完整快照（P4）
+                                    is_full = True
                     except Exception:
                         result["skipped"].append(sid)      # 坏包，不登记
                         continue
@@ -486,6 +722,7 @@ class SnapshotManager:
                         notes='索引重建（磁盘孤儿）',
                         archive_path=str(zf_path),
                         is_full=is_full,
+                        runtime_included=has_runtime,
                     )
                     result["adopted"].append(sid)
                 except Exception:
@@ -500,6 +737,46 @@ class SnapshotManager:
                     ', '.join(result["adopted"][:5])))
             self._save_index()
         return result
+
+    def backfill_runtime_included(self, save: bool = True) -> int:
+        """给缺 runtime_included 的老索引条目补上真实值（2026-11-16）
+
+        起因（线上实测）：1.6.2 之前建的完整快照没有这个字段，
+        ``snapshot_has_runtime()`` 只能按体积猜；但 P1/P3 之后"含运行时"的
+        完整包也只有 ~79 MB，够不到它假设的 100 MB 分界 —— 于是
+        snapshot_20261116_081300 这种**真带运行时**的包被当成"无运行时完整"，
+        既不进 max_full 的 12 个名额，云端也不会让它独占窗口。
+
+        猜不准就去看包本身：只处理"标了完整、又缺字段"的条目，打开中央目录
+        找 `primary-runtime/`，结论写回索引。补过的不再进循环，重复调用幂等。
+        """
+        changed = 0
+        for sid, snap in list(self.snapshots.items()):
+            if not bool(_snap_field(snap, 'is_full', False)):
+                continue
+            if _snap_field(snap, 'runtime_included', None) is not None:
+                continue
+            arc_raw = str(_snap_field(snap, 'archive_path', '') or '').strip() \
+                or str(Path(self.snapshot_dir) / (sid + '.zip'))
+            arc = Path(arc_raw)
+            if not arc.is_file():
+                continue                     # 包没了：交给体积兜底 / 下轮对账
+            try:
+                with zipfile.ZipFile(arc) as zf:
+                    has_runtime = any('primary-runtime' in n.split('/')
+                                      for n in zf.namelist())
+            except Exception:
+                continue                     # 坏包不猜
+            if isinstance(snap, dict):
+                snap['runtime_included'] = has_runtime
+            else:
+                snap.runtime_included = has_runtime
+            changed += 1
+            ZeroFallLogger.info(
+                "[索引回填] {} 补 runtime_included={}".format(sid, has_runtime))
+        if changed and save:
+            self._save_index()
+        return changed
 
     def reload_index(self) -> int:
         """从磁盘重新加载索引（合并新增项，刷新 UI 用）
@@ -574,15 +851,39 @@ class SnapshotManager:
         return plugins
     
     def create_snapshot(self, notes: str = "", force_healthy: bool = False,
-                        include_runtime: bool = False) -> Optional[SnapshotData]:
+                        include_runtime: bool = False,
+                        is_full: bool = None,
+                        include_sessions: bool = None) -> Optional[SnapshotData]:
         """创建快照
-        
+
         Args:
-            include_runtime: True 时纳入运行时（完整快照，约 530 MB）
+            include_runtime: True 时纳入运行时（打包体积 +约 140 MB）
+            is_full: 这份快照算不算"完整快照"。None = 跟 include_runtime 走（老行为）。
+                     必须能单独指定：定时完整快照在"运行时没变"时会跳过运行时以省盘，
+                     但它仍然是一个完整恢复点，不能因此被当成轻量快照 ——
+                     否则定时逻辑的锚点永远不前进，会每分钟重复打一份
+                     （2026-11-12 实测踩到：12:14 之后每分钟一个 24.5 MB）。
+            include_sessions: 是否纳入会话数据。None = 按 is_full 与
+                     config.sessions_only_in_full 推导（完整快照带、轻量不带）。
         """
         """创建快照"""
         try:
             snapshot_id = generate_snapshot_id()
+            # 同一秒内连建两份会拿到同一个 id（实测：第二份覆盖第一份的包，
+            # 索引里也只剩一条 —— 一份快照被静默吞掉）。撞了就按秒往后挪，
+            # 时间戳差 1 秒无伤大雅，吞掉一份快照才是真损失。
+            if snapshot_id in self.snapshots or \
+                    (self.snapshot_dir / (snapshot_id + ".zip")).exists():
+                _base_ts = datetime.strptime(
+                    snapshot_id.replace("snapshot_", ""), "%Y%m%d_%H%M%S")
+                _bump = 1
+                while True:
+                    _cand = "snapshot_" + (_base_ts + timedelta(seconds=_bump)).strftime("%Y%m%d_%H%M%S")
+                    if _cand not in self.snapshots and \
+                            not (self.snapshot_dir / (_cand + ".zip")).exists():
+                        snapshot_id = _cand
+                        break
+                    _bump += 1
             snapshot_path = self.snapshot_dir / snapshot_id
             snapshot_path.mkdir(parents=True, exist_ok=True)
             
@@ -608,6 +909,10 @@ class SnapshotManager:
             else:
                 status = SnapshotStatus.HEALTHY
             
+            # 「这份算不算完整快照」要在最前面定下来：会话要不要带、索引字段、
+            # 包里的 .zf_full 标记都靠它（P4 之后 is_full 已与 include_runtime 解耦）
+            full_flag = include_runtime if is_full is None else bool(is_full)
+
             # 备份插件目录（排除 node_modules 等大目录，否则单次快照可达上百 MB）
             if self.config.backup_plugins:
                 plugins_src = Path(self.config.deepseek_plugins_dir)
@@ -697,8 +1002,15 @@ class SnapshotManager:
             except Exception as e:
                 ZeroFallLogger.warning("认证态备份失败（不影响主快照）: {}".format(e))
             
-            # 备份会话数据（轻量快照默认不带：见 config.sessions_only_in_full）
-            if self._should_include_sessions(include_runtime):
+            # 备份会话数据
+            #
+            # 2026-11-16 二次修正：以前这里传的是 include_runtime，而那个参数的
+            # 真实含义是"这次运行时版本变了没有"（未变就跳过 primary-runtime 省盘）。
+            # 于是"带会话"变成了"换 DSH 版本那天才带" —— 实测 52 份快照里只有 1 份
+            # 有 sessions/，backup_session_data=True 名存实亡。
+            # 现在按"这份是不是完整快照"判：完整快照都带会话，轻量快照都不带。
+            do_sessions = self._should_include_sessions(full_flag, include_sessions)
+            if do_sessions:
                 session_src = self._resolve_session_dir()
                 if session_src is not None:
                     session_dst = snapshot_path / "sessions"
@@ -720,6 +1032,14 @@ class SnapshotManager:
 
             # 创建压缩包
             archive_path = str(snapshot_path) + ".zip"
+
+            # 完整快照（哪怕跳过了运行时）留个标记，索引重建时还能认出来
+            if full_flag:
+                try:
+                    (snapshot_path / ".zf_full").write_text("1", encoding="utf-8")
+                except Exception:
+                    pass
+
             create_archive(str(snapshot_path), archive_path)
             
             # 计算MD5
@@ -738,10 +1058,11 @@ class SnapshotManager:
                 md5_checksum=md5_checksum,
                 plugins=plugins,
                 notes=notes,
-                has_session_data=self._should_include_sessions(include_runtime),
+                has_session_data=bool(do_sessions),
                 has_keys=self.config.backup_keys,
                 archive_path=archive_path,
-                is_full=include_runtime
+                is_full=full_flag,
+                runtime_included=bool(include_runtime)
             )
             
             # 保存到索引
@@ -834,17 +1155,27 @@ class SnapshotManager:
             ZeroFallLogger.error("干净恢复异常: {}".format(e))
         return removed
     
-    def _should_include_sessions(self, include_runtime: bool) -> bool:
+    def _should_include_sessions(self, is_full: bool,
+                                 include_sessions: bool = None) -> bool:
         """会话是否纳入本次快照
 
         sessions_only_in_full=True（默认）：只有完整快照带会话 ——
-        轻量快照每 10 分钟一份，塞 30 MB 会话会让每份从 24 MB 涨到 54 MB，
-        48 份就差出 1.3 GB，而 10 分钟粒度的恢复点根本不需要会话。
+        轻量快照每 10 分钟一份，塞 128 MB 会话会让每份从 14 MB 涨到 164 MB，
+        48 份就差出 7 GB，而 10 分钟粒度的恢复点根本不需要会话。
+
+        参数说明（2026-11-16 二次修正）：这里以前收的是 include_runtime，
+        而它表示"运行时版本变了没有"。结果 `backup_session_data=True` 只在
+        "换 DSH 版本那一天"生效 —— 实测 52 份快照里只有 1 份带 sessions/。
+        现在判据改成"这份是不是完整快照"，并按用户要求：**每份完整快照都带会话**。
+
+        include_sessions 显式传值时不看配置（调用方明说要或不要）。
         """
         if not bool(getattr(self.config, "backup_session_data", False)):
             return False
+        if include_sessions is not None:
+            return bool(include_sessions)
         if bool(getattr(self.config, "sessions_only_in_full", True)):
-            return bool(include_runtime)
+            return bool(is_full)
         return True
 
     def restore_snapshot(self, snapshot_id: str, mode: RestoreMode,
@@ -894,6 +1225,11 @@ class SnapshotManager:
             # 解压快照
             temp_dir = Path(archive_path).parent / f"temp_{snapshot_id}"
             extract_archive(archive_path, str(temp_dir))
+            # 去重快照只存了一份同内容文件，这里在拷贝到目标之前先补齐
+            try:
+                materialize_dedup(temp_dir)
+            except Exception as _dedup_err:
+                ZeroFallLogger.warning("去重复本补齐异常（继续恢复）: {}".format(_dedup_err))
             
             # 恢复前备份当前环境（自愈路径已有崩溃快照，可跳过避免重复堆积）
             backup_snapshot = None
@@ -1071,6 +1407,17 @@ class SnapshotManager:
             # 删除压缩包
             if Path(snapshot_data.archive_path).exists():
                 os.remove(snapshot_data.archive_path)
+
+            # 快照旁边那份「恢复_*.cmd」也要一起删：它是一份快照配一个脚本，
+            # 只删 zip 会在目录里留一堆指向已删数据的空壳。
+            # 实测 D:\dsh备份 攒了 525 个这种死脚本，全部指向不存在的包。
+            try:
+                arc = Path(snapshot_data.archive_path)
+                cmd = arc.with_name("恢复_{}.cmd".format(arc.stem))
+                if cmd.is_file():
+                    cmd.unlink()
+            except Exception:
+                pass
             
             # 从索引中删除
             del self.snapshots[snapshot_id]
@@ -1443,8 +1790,16 @@ class SnapshotManager:
         max_full = int(getattr(self.config, 'max_full_snapshots', 3))
         max_crashed = int(getattr(self.config, 'max_crashed_snapshots', 3))
 
+        # 既不含运行时、也不带会话的"完整快照"实质就是轻量包（P4）：
+        # 一起按轻量配额管，溢出时走 light_policy（默认直接删本地），
+        # 不再当成完整包往云端塞。带会话的完整快照 ~140 MB，必须走完整档。
         lights = sorted(self.get_light_snapshots(), key=lambda s: s.created_at)
-        fulls = sorted(self.get_full_snapshots(), key=lambda s: s.created_at)
+        degraded = [s for s in self.get_full_snapshots()
+                    if not snapshot_is_full_grade(s)]
+        lights = sorted(lights + degraded, key=lambda s: s.created_at)
+        fulls = sorted([s for s in self.get_full_snapshots()
+                        if snapshot_is_full_grade(s)],
+                       key=lambda s: s.created_at)
         crashes = sorted(self.get_crashed_snapshots(), key=lambda s: s.created_at)
 
         # 上限为 0 表示这一类不保留（但不是"无限"，别用 or 吞掉 0）
@@ -1556,6 +1911,12 @@ class SnapshotManager:
             
             extract_archive(snapshot1.archive_path, str(temp1))
             extract_archive(snapshot2.archive_path, str(temp2))
+            # 去重快照要先补齐副本，否则对比会看到一堆"凭空缺失/多出"的文件
+            try:
+                materialize_dedup(temp1)
+                materialize_dedup(temp2)
+            except Exception as _cmp_err:
+                ZeroFallLogger.warning("对比前补齐去重复本失败: {}".format(_cmp_err))
             
             # 比较插件目录
             plugins1 = temp1 / "plugins"
@@ -1660,6 +2021,37 @@ class SnapshotManager:
             ZeroFallLogger.debug("恢复脚本已生成: {}".format(cmd.name))
         except Exception as e:
             ZeroFallLogger.debug("恢复脚本生成失败（不影响快照）: {}".format(e))
+
+    def prune_orphan_restore_scripts(self) -> int:
+        """清掉找不到对应 zip 的「恢复_*.cmd」
+
+        恢复脚本是一份快照配一个。快照被回收（溢出归档 / 保留策略 / 云端收敛）
+        之后脚本留在原地，越攒越多；实测 525 个全部指向已不存在的包，
+        既拖慢目录扫描，也容易误点。
+        """
+        removed = 0
+        try:
+            base = Path(self.snapshot_dir)
+            if not base.is_dir():
+                return 0
+            for c in base.glob('恢复_*.cmd'):
+                try:
+                    stem = c.stem
+                    if not stem.startswith('恢复_'):
+                        continue
+                    zip_name = stem[len('恢复_'):] + '.zip'
+                    if (base / zip_name).is_file():
+                        continue
+                    c.unlink()
+                    removed += 1
+                except Exception:
+                    continue
+            if removed:
+                ZeroFallLogger.info(
+                    "[恢复脚本] 清掉 {} 个指向已删快照的死脚本".format(removed))
+        except Exception as e:
+            ZeroFallLogger.warning("[恢复脚本] 清理失败: {}".format(e))
+        return removed
 
     def write_restore_scripts(self) -> Dict[str, int]:
         """给所有已有快照补一份独立恢复脚本（.cmd）

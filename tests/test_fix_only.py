@@ -90,8 +90,31 @@ print('=== 3. 文件现状 ===')
 for line in (BUG / 'sample_buggy.py').read_text(encoding='utf-8').splitlines():
     print('  ' + line)
 
-ok = res.get('ok') and res.get('changed_files')
+ok = bool(res.get('ok') and res.get('changed_files'))
+kind = str(res.get('kind') or '')
+
+# 上游模型这一轮没给出有效回答，不代表 ZeroFall 的修复链路坏了。
+# 这些 kind 全部来自 modules/acp_client.classify_acp_error：
+#   timeout 请求超时 / unavailable 模型不可用 / ratelimit 限流 /
+#   balance 额度不足 / auth 密钥失效 / forbidden 无权限 /
+#   region 区域限制 / deprecated 模型下线
+# 遇到它们报 SKIP（退出码 0，但明写 SKIP，不算 PASS），
+# 否则一次网络抖动就会被记成代码回归。
+UPSTREAM_KINDS = {'timeout', 'unavailable', 'ratelimit', 'balance',
+                  'auth', 'forbidden', 'region', 'deprecated'}
+
+if ok:
+    verdict, code = 'PASS 修复成功且改动被检测', 0
+elif kind in UPSTREAM_KINDS:
+    verdict, code = 'SKIP 上游模型不可用（{}），本轮无法判定修复能力'.format(kind), 0
+else:
+    verdict, code = 'FAIL 模型有响应但修复未生效', 1
+
 print()
-print('=== 判定:', 'PASS 修复成功且改动被检测' if ok else 'FAIL', '===')
+print('=== 判定: {} ==='.format(verdict))
+if code == 0 and not ok:
+    print('    这不是 ZeroFall 的缺陷：{}'.format(res.get('error') or ''))
+    print('    hint: {}'.format(res.get('hint') or '-'))
+    print('    网络/额度恢复后重跑本用例即可。')
 shutil.rmtree(WORK, ignore_errors=True)
-raise SystemExit(0 if ok else 1)
+raise SystemExit(code)

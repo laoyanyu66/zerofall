@@ -79,16 +79,30 @@ def parse_entries(text: str) -> List[Dict[str, Any]]:
 
 
 def validate(text: str) -> Tuple[bool, str]:
-    """整篇校验：能被解析、是序列、每行有 id"""
+    """整篇校验：能被解析、是序列、每个条目有 id（或用 insert 挂载的一组条目）
+
+    `- insert:` 是 DSH loader 的合法写法：外壳没有 id，真正要挂的插件条目
+    在 insert 列表里，每项自带 id。原来的实现先判 `"id" not in row` 再判
+    insert，导致 insert 外壳永远被判"缺少 id" —— 真实 desktop 补丁里那条
+    `- insert: [resume-sessions]` 就被判死了，配置中心连保存都做不到
+    （2026-11-12 自检发现：desktop #11 / zf-acp #8 / zf-fixer #8 三处全中）。
+    """
     try:
         rows = parse_entries(text)
     except ConfigError as e:
         return False, str(e)
     for i, row in enumerate(rows):
+        if "insert" in row:
+            payload = row["insert"]
+            if not isinstance(payload, list) or not payload:
+                return False, f"第 {i + 1} 个条目的 insert 必须是非空列表"
+            for j, item in enumerate(payload, 1):
+                if not isinstance(item, dict) or "id" not in item:
+                    return False, (
+                        f"第 {i + 1} 个条目的 insert 第 {j} 项缺少 id")
+            continue
         if "id" not in row:
             return False, f"第 {i + 1} 个条目缺少 id"
-        if "insert" in row:
-            continue
         if "config" in row and not isinstance(row["config"], (dict, list, type(None))):
             return False, f"条目 {row.get('id')} 的 config 不是映射"
     return True, "结构 OK"

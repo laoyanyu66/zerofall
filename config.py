@@ -42,6 +42,15 @@ class ZeroFallConfig:
     cloud_overflow_check_minutes: int = 10
     auto_silent_snapshot: bool = True         # 后台定时静默快照
     silent_snapshot_interval_minutes: int = 10  # 静默快照间隔（分钟）
+
+    # 快照页面自动刷新。
+    # 为什么需要：静默快照 / 变更点快照 / 定时完整快照全在后台线程里打，
+    # 页面原来只在手动点「刷新」或某个前台动作之后才重建列表 —— 于是一整天
+    # 明明在存快照，界面最上面还停在下一次手动刷新的时刻，看起来像"不存了"。
+    # 这里默认 5 秒比对一次索引文件的 mtime/大小，只有真变了才重建表格，
+    # 平时一次 stat 的成本可以忽略。
+    snapshot_auto_refresh: bool = True
+    snapshot_auto_refresh_seconds: int = 5
     
     # 快照生命周期策略
     max_light_snapshots: int = 48             # 本地最多保留轻量快照数（48 个 × 10 分钟 ≈ 覆盖 8 小时）
@@ -59,6 +68,13 @@ class ZeroFallConfig:
     #             每积累 N 个轻量快照整一个完整快照（N 个 × 5 分钟 ≈ 同样时长）
     full_snapshot_interval_minutes: int = 30  # 完整快照间隔（分钟，0/负数=改用计数模式）
     full_snapshot_every_n_light: int = 6      # 计数模式：每积累 N 个轻量快照时整一个完整快照
+    # 定时完整快照要不要带 primary-runtime（227 MB 未压缩 / 压缩后约 140 MB）
+    #   on_change —— 默认。只有 .dsh_version 变了才带，其余定时快照跳过。
+    #                每天第一份完整快照（daily）永远带，恢复链不缺运行时。
+    #                动机：实测 12 份完整快照里 11 份是同一份运行时的重复，D: 上白占 ~1.7 GB。
+    #   always    —— 旧行为，每份完整快照都带运行时（最保险，最费盘）。
+    #   never     —— 谁都不带，只靠每日那份。
+    full_snapshot_runtime_mode: str = "on_change"
     cloud_overflow_enabled: bool = True       # 本地快照溢出时云同步后删除
     daily_cloud_consolidate: bool = True      # 次日开机时对云端做按天收敛
     daily_full_snapshot: bool = True          # 每天第一次启动后自动创建一个完整快照
@@ -86,6 +102,14 @@ class ZeroFallConfig:
     report_zf_error: bool = True               # 是否上报 ZeroFall 自身错误
     report_dsh_crash: bool = True              # 是否上报 DeepSeek 崩溃
     auto_apply_update: bool = True             # 子控收到更新包后自动应用
+    # 本地更新通道（2026-11-14）：standalone 模式也能自更新，不依赖主控。
+    # 把 UpdatePackage 格式的 zip 丢进 <install_dir>\updates\，运行中的程序
+    # 就会自己换版并重启（替换动作由提权的子进程完成，不再弹 UAC）。
+    self_update_enabled: bool = True
+    self_update_dir: str = ""                  # 留空 = <install_dir>\updates
+    self_update_interval_minutes: int = 30     # 多久扫一次更新目录
+    self_update_require_idle: bool = True      # 键鼠空闲才动手，免得打断在用的会话
+    self_update_idle_minutes: int = 3
     auto_fix_enabled: bool = True              # 主控自动生成修复包
     master_self_update: bool = True            # 主控生成更新包后也更新自己
     control_poll_seconds: int = 60             # 主控/子控轮询间隔（秒）
@@ -160,12 +184,77 @@ class ZeroFallConfig:
     # 完整：每 4 个传 1 个（≈ 2 小时一个），关键节点够用且省带宽
     cloud_sync_light_stride: int = 12         # 轻量快照每 N 个上传 1 个
     cloud_sync_full_stride: int = 4           # 完整快照每 N 个上传 1 个
+    # 含运行时的完整包（165-242 MB）云端允许保留几份（2026-11-16 / P4）。
+    # 这类包一个就能把 60 分钟的同步窗口占满，所以只留最新 1 份、并让它独占那一轮；
+    # 更老的靠 cloud_history_keep_days 退休。0 = 一份都不传（只剩插件/配置层归档）。
+    cloud_full_runtime_keep: int = 1
     # 云端历史保留期：超过这么多天的整组快照会被清掉，0 = 不限（会无限长）
     cloud_history_keep_days: int = 14
     # 云端体量上限（GB）：只按天数留会失控 —— 一次事故就能塞进 10 GB 并躺满两周。
     # 超过上限时从最旧的完整快照开始删，直到降到上限以下。0 = 不限。
     cloud_max_total_gb: float = 8.0         # 默认留两周
     cloud_sync_encrypt: bool = True           # 上传前 AES 加密（默认开启，恢复时用「导入加密快照」）
+
+    # ── 网盘客户端压力控制（2026-11-12）──
+    # 实测背景：百度网盘开着同步时，zerofall-snapshots 一天新增 94 个文件（≈1.2 GB），
+    # 同步进程常驻内存被顶到 2 GB。原因是「本地溢出 → 云归档」这条路把每一个轻量
+    # 快照都单独加密上传，完全绕过了上面的抽样策略。
+    #
+    # 溢出时轻量快照怎么处理：
+    #   delete  = 直接删本地（云端已有抽样的完整快照覆盖同一时间窗）← 默认，网盘最省
+    #   archive = 照旧逐个加密上传（想留 10 分钟粒度的云端历史就选这个）
+    cloud_overflow_light_policy: str = "delete"
+    # 每天最多往同步盘写多少个包（0 = 不限）。按"读同步盘里今天的 mtime"计数，跨重启有效。
+    cloud_upload_max_per_day: int = 24
+    # 每轮溢出检查最多传几个：一轮塞 10 个文件，网盘客户端会同时开一堆上传任务吃内存；
+    # 摊成每 10 分钟 1-2 个，同步进程的峰值内存明显低。
+    cloud_upload_per_cycle: int = 2
+
+    # ── 云端窗口模式（2026-11-13）──
+    # 目标：让百度网盘客户端不必 24 小时常驻。
+    # 实测（11-13 23:45）：BaiduNetdisk* 共 12 个进程 1.99 GB，系统空闲内存只剩 1.9 GB / 11.9%。
+    # 而同步盘方案的本质是"ZeroFall 往目录写文件、客户端自己传"，
+    # 所以只要把写入集中到每天一小段时间，客户端就只需要在那段时间在线。
+    #
+    #   windowed = 只在每天固定窗口内写同步盘；窗口内由 ZeroFall 拉起客户端，
+    #              窗口结束静置后自动关闭（默认）
+    #   always   = 老行为（随时写、客户端一直在线）
+    #   manual   = 随时写，但 ZeroFall 不碰客户端开关
+    cloud_client_mode: str = "windowed"
+    cloud_window_start: str = "03:30"      # 窗口开始（HH:MM，允许跨午夜）
+    cloud_window_minutes: int = 60         # 窗口时长
+    cloud_window_max_packages: int = 8     # 一个窗口最多往同步盘塞几个包
+    cloud_window_auto_close: bool = True   # 窗口结束且静置够久后关闭 ZeroFall 自己拉起的客户端
+    cloud_window_settle_minutes: int = 8   # 最后一次写入后等多久再关（给上传队列留收尾时间）
+    # 窗口时机（2026-11-14）：固定 03:30 只适合常开机的机器。开机时间不固定、
+    # 还可能整天不开机的话，定点窗口等于多数日子都跑不到。所以默认改成"看机会开窗"：
+    #   auto  = 程序起来后先等一会儿 → 确实有东西要传 → 键鼠空闲够久 → 才开一轮窗口。
+    #           两次窗口至少隔 gap_hours（一天重启几次也只传一次）；
+    #           超过 force_hours 还没传过就无视空闲硬传一次（防止整天在用电脑永远等不到空闲）。
+    #   fixed = 老行为，按 cloud_window_start 定点开。
+    cloud_window_trigger: str = "auto"
+    # 同步频率（2026-11-14）：0 = 不按频率，改用下面的 gap_hours。
+    # 设 1 = 每天最多一轮窗口；3 = 每三天；7 = 一周一次。
+    # 设完后：暂存区自动"每天留 1 轻 + 1 完整"，窗口一次把积压的整批搬走，
+    # 所以频率拉长不会丢恢复点，也不会让暂存区无限涨。
+    cloud_sync_cadence_days: int = 1
+    cloud_window_start_delay_minutes: int = 5   # 启动后至少等多久才考虑开窗（别跟开机抢资源）
+    cloud_window_idle_minutes: int = 5          # 键鼠空闲多久算"人不在"
+    cloud_window_gap_hours: int = 20            # 两次窗口最小间隔
+    cloud_window_force_hours: int = 36          # 超过这么久没传过就无视空闲
+    # 窗口外把包暂存在本地 outbox（不碰同步盘），等窗口打开一次性搬过去。
+    # 关掉它 = 窗口外干脆不归档，完整快照会顶到本地硬上限被删，不建议。
+    cloud_outbox_enabled: bool = True
+    cloud_outbox_dir: str = ""             # 空 = <快照目录>\_cloud_outbox
+    cloud_outbox_max: int = 6              # 暂存区最多压几个包（约 6×30 MB）
+
+    # 静默快照去重（2026-11-12）：内容指纹（插件+配置）没变就跳过这一轮。
+    # 实测一天 27 份静默快照 × (42 MB 目录 + 24.5 MB 压缩) 里，多数是同一份内容。
+    # 手动「快速快照」不受影响。关掉 = 回到"每 10 分钟必拍一份"。
+    silent_snapshot_skip_unchanged: bool = True
+    # 上一条的兜底：指纹再怎么"没变"，也至少每 N 小时打一份，
+    # 避免指纹卡死（插件目录被挪走等）导致快照链断掉。0 = 不兜底。
+    silent_snapshot_max_gap_hours: int = 6
     
     # 前置校验配置
     pre_launch_check_enabled: bool = True     # 前置启动校验开关
@@ -189,6 +278,11 @@ class ZeroFallConfig:
     auto_launch_deepseek: bool = True            # 自检全部通过后自动启动DeepSeek
     auto_rollback_on_crash: bool = True          # DeepSeek崩溃后自动回退最新健康快照并重启
     max_auto_rollback: int = 2                   # 连续自动回退多少次后转为人工确认（不再是硬上限）
+    # 崩溃「保留现场」（不回退快照）后，自动拉起豆包，把崩溃现场交给它分析/修复。
+    # 只做本机 GUI 接力：启动豆包 → 新对话 → 粘贴提示词 → 回车；失败会退化成"提示词进剪贴板"。
+    doubao_relay_on_crash: bool = True
+    doubao_exe: str = ""                         # 豆包可执行文件；留空自动找（D:\Doubao\app\Doubao.exe / 开始菜单）
+    doubao_relay_prompt: str = ""               # 留空用内置文案（见 modules/doubao_relay.py:DEFAULT_PROMPT）
     # 崩溃后恢复对话框的自动倒计时（秒）。默认 600 = 10 分钟：
     # 崩溃时用户可能不在电脑前，1 分钟太短容易"还没看清就自动恢复了"。
     # 设为 0 表示不限时，必须手动点「立即恢复」。
@@ -276,6 +370,29 @@ class ZeroFallConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
+def default_config_path(base_dir=None) -> Path:
+    """算出默认的 zerofall_config.json 路径（P5，2026-11-16）
+
+    三种情形：
+      1. `ZF_CONFIG_PATH` 环境变量 —— 显式指定，优先；
+      2. 打包运行（frozen）—— exe 同目录，这是历史行为；
+      3. 源码运行 —— **优先继承 dist 那份现役配置**。
+
+    第 3 条为什么这么改：源码树的 zerofall_config.json 少了 9 项云窗口字段
+    （cloud_client_mode / cloud_window_* / cloud_outbox_*），从源码调试时这些
+    字段退回默认值，窗口化悄悄失效、百度网盘退回常驻 —— 而两份文件各改各的，
+    现场几乎不可能看出来。现在只有一份生效；只有 dist 配置不存在时才退回源码树那份。
+    """
+    env_path = str(os.environ.get('ZF_CONFIG_PATH') or '').strip()
+    if env_path:
+        return Path(env_path)
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent / "zerofall_config.json"
+    base = Path(base_dir) if base_dir else Path(__file__).parent
+    live = base / "dist" / "zerofall_config.json"
+    return live if live.is_file() else (base / "zerofall_config.json")
+
+
 class ConfigManager:
     """配置管理器"""
     
@@ -283,10 +400,11 @@ class ConfigManager:
         # 关键：打包后必须用 exe 所在目录的绝对路径，
         # 否则 Start-Process 启动时工作目录不确定，会导致读不到配置
         if config_path is None:
-            if getattr(sys, 'frozen', False):
-                config_path = str(Path(sys.executable).parent / "zerofall_config.json")
-            else:
-                config_path = str(Path(__file__).parent / "zerofall_config.json")
+            resolved = default_config_path()
+            if (not getattr(sys, 'frozen', False)
+                    and resolved.parent.name == 'dist'):
+                print("[配置] 源码模式：沿用现役配置 {}".format(resolved))
+            config_path = str(resolved)
         self.config_path = Path(config_path)
         self.config: Optional[ZeroFallConfig] = None
         self._ensure_dirs()

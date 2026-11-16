@@ -154,6 +154,10 @@ def build_harness(cfg, sm):
     h.guardian = FakeGuardian()
     h._daily_full_busy = False
     h.statusBar = lambda: FakeStatusBar()
+    # 真实实现成功后（ui/main_window.py:1443）会调 _notify_snapshot_tab()；
+    # 夹具里没这个桩 → 返回前抛 AttributeError → 被外层 except 吞成 return False，
+    # 表现为"只创建 1 次"绿、"创建了完整快照"红。2026-11-12 自检发现。
+    h._notify_snapshot_tab = lambda *a, **k: None
     return h
 
 

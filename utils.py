@@ -29,12 +29,15 @@ def calculate_md5(file_path: str) -> str:
 
 def calculate_directory_md5(dir_path: str, exclude_dirs: Optional[set] = None,
                             exclude_files: Optional[list] = None,
+                            exclude_rel_prefixes: Optional[tuple] = None,
                             max_files: int = 20000) -> Dict[str, str]:
     """计算目录下所有文件的MD5值
     
     Args:
         exclude_dirs:  要跳过的目录名集合（运行时/缓存等，避免扫描上万文件）
         exclude_files: 要跳过的文件名模式列表（如 '*.log'），支持通配符
+        exclude_rel_prefixes: 按相对路径前缀排除的元组（如 'memory-tiers/'），
+                              用于排除特定子树而非整个同名目录
         max_files:     最多计算的文件数上限，防止极端情况卡死
     """
     import fnmatch
@@ -47,6 +50,7 @@ def calculate_directory_md5(dir_path: str, exclude_dirs: Optional[set] = None,
     
     skip_dirs = {d.lower() for d in (exclude_dirs or set())}
     patterns = list(exclude_files or [])
+    rel_prefixes = tuple(p.replace('\\', '/').rstrip('/') + '/' for p in (exclude_rel_prefixes or ()))
     count = 0
     
     for root, dirs, files in os.walk(dir_path):
@@ -63,6 +67,10 @@ def calculate_directory_md5(dir_path: str, exclude_dirs: Optional[set] = None,
             fp = Path(root) / name
             try:
                 rel_path = fp.relative_to(dir_path)
+                rel_str = str(rel_path).replace('\\', '/').lstrip('./')
+                # 相对路径前缀排除（memory-tiers/ storages/memory/ blue/ 等）
+                if rel_prefixes and any(rel_str.startswith(p) for p in rel_prefixes):
+                    continue
                 md5_dict[str(rel_path)] = calculate_md5(str(fp))
                 count += 1
             except Exception:

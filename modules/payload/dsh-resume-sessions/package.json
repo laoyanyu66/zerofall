@@ -1,0 +1,27 @@
+{
+  "name": "dsh-resume-sessions",
+  "version": "1.0.0",
+  "description": "dsh 启动后自动恢复并续跑上次关闭前仍在运行的会话（实时快照 + 带超时的 resume + goal 续行重新授权）",
+  "license": "MIT",
+  "author": "YG",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    }
+  }
+}

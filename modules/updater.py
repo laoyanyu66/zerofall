@@ -154,9 +154,10 @@ class UpdatePackage:
 
 
 def _spawn_replace_and_restart(script_body: str, log_path: Path = None):
-    """用独立的 PowerShell 进程完成"等主进程退出 -> 替换 exe -> 重启"。
+    """【已弃用，保留兼容】用 PowerShell 等主进程退出后替换 exe。
 
-    必须在主进程完全退出后替换，否则 exe 被占用写不进去。
+    2026-11-15 实测这条路在真实运行环境下不成立：父进程一退出，这个子进程就被
+    一并带走，既没替换也没日志。换版改走 `_arm_restart_after_update`（一次性计划任务）。
     """
     log = log_path or (Path(os.environ.get('TEMP', '.')) / 'zerofall_update.log')
     script = (
@@ -169,10 +170,58 @@ def _spawn_replace_and_restart(script_body: str, log_path: Path = None):
     ps = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
     args = ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', script]
     try:
-        subprocess.Popen([str(ps)] + args, creationflags=0x08000000)  # DETACHED_PROCESS
+        # 0x08000000 = CREATE_NO_WINDOW，不是 DETACHED_PROCESS（后者是 0x8）。
+        # 这里要的只是"别闪控制台窗口"；这个 PowerShell 没有被 job 绑定，
+        # 父进程退出后它会自己把脚本跑完，不需要真正的 DETACHED_PROCESS。
+        subprocess.Popen([str(ps)] + args, creationflags=0x08000000)
         return True
     except Exception:
         return False
+
+
+RESTART_TASK_NAME = 'ZeroFall-Restart-After-Update'
+
+
+def _arm_restart_after_update(target_exe, delay_seconds: int = 8):
+    """安排"延迟启动新 exe"：一次性计划任务，跟当前进程的生死解耦。
+
+    为什么不用 subprocess 直接在退出前拉起来：实测父进程退出会把这个子进程一起
+    带走（见 `_spawn_replace_and_restart` 的注释）。计划任务由 Task Scheduler
+    服务拉起，父进程退不退出都不影响它。
+
+    返回 (是否成功, 说明)；失败不影响"exe 已经换成新版"这个事实。
+    """
+    exe = Path(target_exe)
+    runner = exe.parent / 'updates' / 'restart-after-update.cmd'
+    try:
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        body = (
+            '@echo off\r\n'
+            'ping -n {d} 127.0.0.1 >nul\r\n'
+            'start "" "{exe}"\r\n'
+            'schtasks /Delete /TN "{tn}" /F >nul 2>&1\r\n'
+        ).format(d=int(delay_seconds) + 1, exe=exe, tn=RESTART_TASK_NAME)
+        runner.write_bytes(body.encode('ascii', 'ignore'))
+    except Exception as e:
+        return False, '写重启脚本失败: {}'.format(e)
+
+    schtasks = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'schtasks.exe'
+    st = time.strftime('%H:%M', time.localtime(time.time() + 300))
+    try:
+        r1 = subprocess.run([str(schtasks), '/Create', '/F', '/TN', RESTART_TASK_NAME,
+                             '/TR', str(runner), '/SC', 'ONCE', '/ST', st],
+                            creationflags=0x08000000, capture_output=True, text=True)
+        if r1.returncode != 0:
+            return False, '建任务失败: {}'.format(
+                ((r1.stderr or '') + (r1.stdout or '')).strip()[:120])
+        r2 = subprocess.run([str(schtasks), '/Run', '/TN', RESTART_TASK_NAME],
+                            creationflags=0x08000000, capture_output=True, text=True)
+        if r2.returncode != 0:
+            return False, '触发任务失败: {}'.format(
+                ((r2.stderr or '') + (r2.stdout or '')).strip()[:120])
+    except Exception as e:
+        return False, '调度重启失败: {}'.format(e)
+    return True, '计划任务 {} 已触发'.format(RESTART_TASK_NAME)
 
 
 def apply_update(package_path, install_dir=None, restart=True, log_path=None):
@@ -216,16 +265,33 @@ def apply_update(package_path, install_dir=None, restart=True, log_path=None):
         return False, '更新包内没有 exe'
 
     if restart:
-        body = (
-            'try {{ Copy-Item "{new}" -Destination "{target}" -Force -ErrorAction Stop; '
-            'Remove-Item "{tmp}" -Recurse -Force -ErrorAction SilentlyContinue; '
-            'Start-Process "{target}"; '
-            'Add-Content -Path $log -Value ("{v} updated at " + (Get-Date -Format "s")) }} '
-            'catch {{ Add-Content -Path $log -Value ("FAILED: " + $_.Exception.Message) }}'
-        ).format(new=str(new_exe), target=str(target_exe), tmp=str(install_dir / '_update_tmp'), v=version)
-        if not _spawn_replace_and_restart(body, log_path):
-            return False, '无法调度替换任务'
-        return True, '已安排替换并重启（v{}）'.format(version)
+        # 2026-11-15 修：原来靠"主进程退出后再复制"的外部 PowerShell —— 实测那一刻
+        # 子进程被一并带走（%TEMP% 没有 zerofall_update.log、exe 没换、只剩
+        # dist\_update_tmp\ZeroFall.exe 和一份 .bak）。于是"自更新"看起来成功，
+        # 版本其实永远停在旧的。
+        #
+        # 新做法分两步，都不依赖"父进程死后再干活"：
+        #   1. 本进程内先改名让开句柄，再拷新 exe（Windows 允许给运行中的 exe 改名）；
+        #   2. 重启交给一次性计划任务（Task Scheduler 拉起的进程不受父进程退出影响）。
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        old_path = install_dir / '{}.old-{}'.format(UpdatePackage.EXE_NAME, stamp)
+        try:
+            os.replace(str(target_exe), str(old_path))     # 同卷改名，运行中的映像不受影响
+            shutil.copy2(str(new_exe), str(target_exe))
+            shutil.rmtree(install_dir / '_update_tmp', ignore_errors=True)
+        except Exception as e:
+            try:                                           # 尽力回滚，别把现场弄坏
+                if not target_exe.exists() and old_path.exists():
+                    os.replace(str(old_path), str(target_exe))
+            except Exception:
+                pass
+            return False, '替换 exe 失败: {}'.format(e)
+
+        armed, detail = _arm_restart_after_update(target_exe)
+        if armed:
+            return True, '已替换并安排重启（v{}，{}）'.format(version, detail)
+        # 任务没建成也不能把程序关掉：exe 已经是新的，下次启动就是新版本
+        return True, '已替换 exe（v{}），但这轮没能安排自动重启（{}），下次启动生效'.format(version, detail)
 
     # 不重启：直接替换（要求当前不是该 exe 本身在跑）
     try:

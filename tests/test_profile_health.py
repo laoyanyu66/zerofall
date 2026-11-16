@@ -35,6 +35,13 @@ def level_of(report, cid):
     return None
 
 
+def detail_of(report, cid):
+    for c in report["checks"]:
+        if c["id"] == cid:
+            return c.get("detail", "")
+    return ""
+
+
 def build_profile(root: Path, *, bundles=None, deps=None, patch_entries=None,
                   bom=False, node_modules: dict = None, lock_text=None,
                   bad_json=False) -> Path:
@@ -66,18 +73,22 @@ def build_profile(root: Path, *, bundles=None, deps=None, patch_entries=None,
     ]
     lines = []
     for e in entries:
-        lines.append("- id: {}".format(e["id"]))
+        keys = []
+        if e.get("id"):
+            keys.append("id: {}".format(e["id"]))
         if e.get("name"):
-            lines.append("  name: \"{}\"".format(e["name"]))
+            keys.append('name: "{}"'.format(e["name"]))
         if e.get("insert") is not None:
-            lines.append("  insert:")
+            keys.append("insert:")
             for item in e["insert"]:
-                if isinstance(item, dict):
-                    lines.append("    - id: {}".format(item.get("id")))
-                else:
-                    lines.append("    - {}".format(item))
+                iid = item.get("id") if isinstance(item, dict) else item
+                keys.append("  - id: {}".format(iid))
         if e.get("config") is not None:
-            lines.append("  config: {}")
+            keys.append("config: {}")
+        # 块的第一个真实键做 `- key:`，其余加两空格缩进；
+        # 顶层没有 id 的条目（纯 `- insert:` 新增挂载）也能正确成形。
+        for i, k in enumerate(keys):
+            lines.append(("- " + k) if i == 0 else ("  " + k))
         lines.append("")
     (pdir / "cordis.patch.yml").write_text("\n".join(lines), encoding="utf-8")
 
@@ -161,15 +172,34 @@ home = build_profile(Path(tempfile.mkdtemp(prefix='zf_h11_')),
 check("链接缺失 → error", level_of(ph.run_all(home, "desktop"), "links") == "error")
 
 print("== 8. patch ==")
+# insert 是「新建挂载」，子项 id 本来就不在顶层 —— 真实 profile 里的
+# dsh-resume-sessions 就是这种形状，不能被报成悬空引用。
 home = build_profile(Path(tempfile.mkdtemp(prefix='zf_h12_')),
-                     patch_entries=[{"id": "group-a", "insert": [{"id": "ghost-entry"}]}],
+                     patch_entries=[{"insert": [{"id": "brand-new-plugin"}]}],
                      node_modules={"dsh-purge-community": "dir"})
-check("悬空 insert → warn", level_of(ph.run_all(home, "desktop"), "patch") == "warn")
+check("顶层无 id 的 insert（新增挂载）→ ok",
+      level_of(ph.run_all(home, "desktop"), "patch") == "ok")
+home = build_profile(Path(tempfile.mkdtemp(prefix='zf_h12b_')),
+                     patch_entries=[{"id": "group-a", "insert": [{"id": "taken"}]},
+                                    {"id": "taken"}],
+                     node_modules={"dsh-purge-community": "dir"})
+check("insert 新建 id 与顶层撞车 → warn",
+      level_of(ph.run_all(home, "desktop"), "patch") == "warn")
 home = build_profile(Path(tempfile.mkdtemp(prefix='zf_h13_')),
-                     patch_entries=[{"id": "group-a", "insert": [{"id": "x"}, {"id": "x"}]},
-                                    {"id": "x"}],
+                     patch_entries=[{"id": "group-a", "insert": [{"id": "x"}, {"id": "x"}]}],
                      node_modules={"dsh-purge-community": "dir"})
 check("块内重复 → warn", level_of(ph.run_all(home, "desktop"), "patch") == "warn")
+home = build_profile(Path(tempfile.mkdtemp(prefix='zf_h13b_')),
+                     patch_entries=[{"id": "group-a", "insert": [{"id": "taken"}, {"id": "taken"}]},
+                                    {"id": "taken"}],
+                     node_modules={"dsh-purge-community": "dir"})
+rep = ph.run_all(home, "desktop")
+detail = detail_of(rep, "patch")
+# 两条规则不能互相掩盖：同时存在时要一次报全，
+# 否则用户修完撞车再跑一次才发现块内还有重复。
+check("撞车 + 块内重复 一次报全",
+      level_of(rep, "patch") == "warn" and "撞车" in detail and "块内重复" in detail,
+      detail)
 
 print("== 9. 真实 profile 只读核对 ==")
 real_home = Path(os.environ.get("DSH_HOME", str(Path.home() / ".dsh")))
@@ -179,7 +209,10 @@ if (real_home / "profiles" / "desktop" / "package.json").is_file():
     check("真实 profile 能跑完十项", len(rep["checks"]) == 10, len(rep["checks"]))
     check("真实 profile 的 bundle 全部可解析",
           level_of(rep, "bundles") == "ok", rep["checks"][1]["detail"])
-    check("真实 profile 的联接正常", level_of(rep, "links") == "ok", rep["checks"][5]["detail"])
+    # 真实 profile 里 pnpm 把部分 vendor 依赖落成了实体副本（内容与源一致）。
+    # 那是 info 不是问题：只跑起来完全不需要链接，丢的只是"改源码即时生效"。
+    check("真实 profile 的联接正常",
+          level_of(rep, "links") in ("ok", "info"), rep["checks"][5]["detail"])
 else:
     check("真实 profile 检查（跳过）", True)
 

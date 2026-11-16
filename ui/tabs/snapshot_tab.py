@@ -8,9 +8,10 @@ from typing import Tuple, Dict
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QInputDialog,
-    QAbstractItemView, QApplication, QDialog, QLabel, QFileDialog
+    QAbstractItemView, QApplication, QDialog, QLabel, QFileDialog,
+    QCheckBox
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer, QItemSelectionModel
 from PyQt6.QtGui import QColor
 
 import sys
@@ -69,15 +70,41 @@ class SnapshotTab(QWidget):
         import_enc_btn.clicked.connect(self._on_import_encrypted)
         button_layout.addWidget(import_enc_btn)
         
+        # ── 自动刷新 ──────────────────────────────────────────────
+        # 静默快照、变更点快照、定时完整快照都是后台线程打的，页面不主动去拉，
+        # 列表就一直停在"上次手动刷新"那一刻 —— 看着像程序没在存快照了。
+        # 这里默认每 5 秒比对一次索引文件的 mtime/大小，真变了才重建表格。
+        self._auto_seconds = self._auto_refresh_seconds()
+        self.auto_refresh_chk = QCheckBox("自动刷新")
+        self.auto_refresh_chk.setChecked(self._auto_refresh_enabled())
+        self.auto_refresh_chk.setToolTip(
+            "每 {} 秒检查一次快照索引，有新快照立刻显示（不打断当前选中行）".format(
+                self._auto_seconds))
+        self.auto_refresh_chk.toggled.connect(self._on_auto_refresh_toggled)
+        
+        self.sync_label = QLabel("")
+        self.sync_label.setObjectName('dim')
+        self.sync_label.setStyleSheet("font-size: 12px; color: #8899aa;")
+        self.sync_label.setMinimumWidth(110)
+        self.sync_label.setAlignment(Qt.AlignmentFlag.AlignRight
+                                     | Qt.AlignmentFlag.AlignVCenter)
+        
         button_layout.addStretch()
         layout.addLayout(button_layout)
         
         # 磁盘占用 + 可恢复性统计（回答"快照吃了多少 G、哪个能回"）
+        # 自动刷新开关与同步时间戳跟统计放同一行右端：按钮行已有 7 个按钮，
+        # 再往那儿塞会被 1000 px 宽的窗口直接切掉（实测"自动刷新"只剩"自动"）。
         self.snap_stats_label = QLabel("")
         self.snap_stats_label.setObjectName('dim')
         self.snap_stats_label.setWordWrap(True)
         self.snap_stats_label.setStyleSheet("font-size: 12px;")
-        layout.addWidget(self.snap_stats_label)
+        
+        stats_row = QHBoxLayout()
+        stats_row.addWidget(self.snap_stats_label, 1)
+        stats_row.addWidget(self.auto_refresh_chk, 0)
+        stats_row.addWidget(self.sync_label, 0)
+        layout.addLayout(stats_row)
 
         # 对比提示标签
         self.compare_hint_label = QLabel("")
@@ -103,7 +130,95 @@ class SnapshotTab(QWidget):
         self.snapshot_table.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         layout.addWidget(self.snapshot_table)
         
+        self._index_sig = None      # 上次见到的索引指纹 (mtime_ns, size)
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(int(self._auto_seconds * 1000))
+        self._auto_timer.timeout.connect(self._auto_tick)
+        
         self.refresh_snapshot_list()
+        if self.auto_refresh_chk.isChecked():
+            self._auto_timer.start()
+    
+    # ── 自动刷新 ──────────────────────────────────────────────
+    def _auto_refresh_seconds(self) -> int:
+        """检查周期（秒）。配置里可调，夹在 2~120 之间防手滑。"""
+        try:
+            v = int(getattr(self.config, 'snapshot_auto_refresh_seconds', 5))
+        except Exception:
+            v = 5
+        return max(2, min(120, v))
+    
+    def _auto_refresh_enabled(self) -> bool:
+        try:
+            return bool(getattr(self.config, 'snapshot_auto_refresh', True))
+        except Exception:
+            return True
+    
+    def _on_auto_refresh_toggled(self, on: bool):
+        """开关自动刷新，并把偏好写回配置（有 save 就落盘）"""
+        try:
+            setattr(self.config, 'snapshot_auto_refresh', bool(on))
+            save = getattr(self.config, 'save', None)
+            if callable(save):
+                save()
+        except Exception:
+            pass
+        if on:
+            self._auto_timer.start()
+            self._auto_tick(force=True)
+        else:
+            self._auto_timer.stop()
+            self.sync_label.setText("自动刷新已关闭")
+    
+    def _index_signature(self):
+        """索引文件的轻量指纹：只 stat，不解析。
+
+        快照创建完会重写 snapshot_index.json，所以 mtime/size 一变就意味着
+        "有新增或删除"。解析 200 KB JSON 只是为了发现没变化，没必要每 5 秒做一次。
+        """
+        try:
+            st = Path(self.snapshot_manager.index_file).stat()
+            return (st.st_mtime_ns, st.st_size)
+        except Exception:
+            return None
+    
+    def _auto_tick(self, force: bool = False):
+        """定时器回调：有变化才重建列表"""
+        if not force and not self.auto_refresh_chk.isChecked():
+            return
+        # 恢复/删除/对比的模态框开着时别刷新，否则选中的行会被刷走
+        try:
+            if QApplication.activeModalWidget() is not None:
+                return
+        except Exception:
+            pass
+        # 在别的页签/最小化时不做无意义重建（切回来时 force 一次即可）
+        if not force and not self.isVisible():
+            return
+        sig = self._index_signature()
+        if not force and sig is not None and sig == self._index_sig:
+            return
+        self.refresh_snapshot_list()
+    
+    def _mark_synced(self):
+        """在按钮行显示"列表同步到哪个时刻"，让"没有新快照"和"没刷新"区分开"""
+        try:
+            self.sync_label.setText("已同步 {}".format(
+                datetime.now().strftime("%H:%M:%S")))
+        except Exception:
+            pass
+    
+    def showEvent(self, event):
+        """切回本页时立刻对一次索引，不必干等下个 5 秒 tick
+
+        定时器在页面不可见时会主动跳过（别在别的页签上白重建表格），
+        所以切回来这一下要补刷一次。
+        """
+        super().showEvent(event)
+        try:
+            QTimer.singleShot(0, self._auto_tick)
+        except Exception:
+            pass
     
     def _on_import_encrypted(self):
         """从云端加密快照（.enc）解密导入并恢复"""
@@ -527,8 +642,68 @@ class SnapshotTab(QWidget):
         
         dlg.exec()
     
-    def refresh_snapshot_list(self):
-        """刷新快照列表（先从磁盘重载索引，外部创建的快照也能立刻看到）"""
+    def _capture_table_state(self):
+        """记下当前选中行 + 滚动位置（自动刷新每几秒一次，不能把手动挑的行刷没）"""
+        sel_ids, cur_id = set(), None
+        try:
+            sel_model = self.snapshot_table.selectionModel()
+            if sel_model is not None:
+                for idx in sel_model.selectedRows():
+                    it = self.snapshot_table.item(idx.row(), 0)
+                    if it is not None:
+                        sel_ids.add(it.text())
+            cur = self.snapshot_table.currentRow()
+            if cur >= 0:
+                it = self.snapshot_table.item(cur, 0)
+                cur_id = it.text() if it is not None else None
+        except Exception:
+            pass
+        try:
+            scroll = self.snapshot_table.verticalScrollBar().value()
+        except Exception:
+            scroll = 0
+        return sel_ids, cur_id, scroll
+    
+    def _restore_table_state(self, sel_ids, cur_id, scroll):
+        """按 snapshot id 还原选中行与滚动位置（行号会因为新增快照整体后移）"""
+        if not sel_ids and cur_id is None:
+            return
+        try:
+            self.snapshot_table.blockSignals(True)
+            model = self.snapshot_table.model()
+            sel_model = self.snapshot_table.selectionModel()
+            # setRowCount 之后旧选择可能还挂着（行号被复用），先清干净再按 id 选
+            self.snapshot_table.clearSelection()
+            for row in range(self.snapshot_table.rowCount()):
+                it = self.snapshot_table.item(row, 0)
+                if it is None:
+                    continue
+                if it.text() in sel_ids:
+                    sel_model.select(
+                        model.index(row, 0),
+                        QItemSelectionModel.SelectionFlag.Select
+                        | QItemSelectionModel.SelectionFlag.Rows)
+                if cur_id is not None and it.text() == cur_id:
+                    sel_model.setCurrentIndex(
+                        model.index(row, 0),
+                        QItemSelectionModel.SelectionFlag.NoUpdate)
+            self.snapshot_table.verticalScrollBar().setValue(scroll)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.snapshot_table.blockSignals(False)
+            except Exception:
+                pass
+    
+    def refresh_snapshot_list(self, keep_state: bool = True):
+        """刷新快照列表（先从磁盘重载索引，外部创建的快照也能立刻看到）
+
+        keep_state=True：保留用户当前的选中行和滚动位置。自动刷新会周期性
+        调这个方法，每次重建表格都清掉选择的话，就没法"挑一个再点恢复"了。
+        """
+        sel_ids, cur_id, scroll = ((None, None, 0) if not keep_state
+                                   else self._capture_table_state())
         try:
             self.snapshot_manager.reload_index()
         except Exception:
@@ -539,6 +714,7 @@ class SnapshotTab(QWidget):
         except Exception:
             restorable = {x.snapshot_id for x in snapshots}
         
+        self.snapshot_table.setUpdatesEnabled(False)
         self.snapshot_table.setRowCount(len(snapshots))
         
         for row, snapshot in enumerate(snapshots):
@@ -611,8 +787,15 @@ class SnapshotTab(QWidget):
                     "所以目前无法直接恢复到这个点。")
             self.snapshot_table.setItem(row, 7, ok_item)
             self.snapshot_table.setItem(row, 8, QTableWidgetItem(snapshot.notes))
-    
+        
+        self.snapshot_table.setUpdatesEnabled(True)
+        if keep_state:
+            self._restore_table_state(sel_ids, cur_id, scroll)
+        
         self._update_stats()
+        # 记录本次刷新对应的索引指纹：定时器下一轮没变化就直接跳过
+        self._index_sig = self._index_signature()
+        self._mark_synced()
 
     def _update_stats(self):
         """更新顶部磁盘占用统计

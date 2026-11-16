@@ -90,3 +90,12 @@ secret_vault.zfv
 # 本机自检报告/个人笔记
 自检报告_*.md
 测试*.md
+
+# 旁路构建产物（不覆盖正在跑的 dist，验证完就删）
+dist_new/
+build_new/
+build_new_*/
+_stage_*/
+# 本机记录（含绝对路径 / 注册表备份，不进公开仓库）
+Run-key-backup-*.txt
+zerofall-*.md

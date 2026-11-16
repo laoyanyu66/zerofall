@@ -570,15 +570,35 @@ class NativeTrayIcon(QObject):
                 pass
     
     def setToolTip(self, tooltip: str):
-        """设置提示文本"""
+        """设置提示文本
+
+        已添加的图标只改 TIP（NIM_MODIFY + NIF_TIP），不要整块重加：
+        原来的写法是 `_added=False` 再 `_add_tray_icon()`，而主窗口的提示里含
+        快照计数，几乎每轮刷新都会变 → 实测一天触发 97 次整块重加，每次都要
+        走一遍"NIM_ADD 失败 → sleep 0.15s → 重试 → 再写一遍注册表"，白睡十几秒
+        还让托盘图标闪一下（2026-11-12 自检发现）。
+        """
         self.tooltip = tooltip
-        # 需要重新创建图标
-        if self._added:
-            try:
-                self._added = False
-                self._add_tray_icon()
-            except:
-                pass
+        if not self._added or not self._hwnd:
+            return
+        try:
+            shell32 = ctypes.windll.shell32
+            nid = NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+            nid.hWnd = self._hwnd
+            nid.uID = self._tray_id
+            nid.uFlags = NIF_TIP
+            nid.szTip = str(tooltip or "")[:127]
+            if shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)):
+                return
+        except Exception:
+            pass
+        # NIM_MODIFY 被拒（图标可能已经消失，比如 explorer 重启过）→ 退回整块重加
+        try:
+            self._added = False
+            self._add_tray_icon()
+        except Exception:
+            pass
     
     def setContextMenu(self, menu: QMenu):
         """设置右键菜单"""

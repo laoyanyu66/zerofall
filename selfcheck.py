@@ -18,6 +18,9 @@
    出过 8 个：界面上没开关、代码里没引用，纯摆设
 
 5. 重复的顶层定义
+
+前九项修的是「代码本身」；第 10 项修的是「这台机器上 DSH profile 会不会被重置」——
+那才是 ZeroFall 存在的理由，之前却没接进这个入口。
 """
 import ast
 import json
@@ -263,8 +266,13 @@ def check_unused_config_fields():
 def check_config_duplication():
     """配置双份漂移：dist 与源码树各有一份 zerofall_config.json
 
-    现役的是 dist 那份（程序同级）。源码树那份只在"从源码跑"时生效，
-    两份不一致时，调试读到的值会和实际运行的不同 —— 这种坑很难现场看出来。
+    P5（2026-11-16）：`ConfigManager` 在源码模式下会**优先继承 dist 那份**
+    （dist 有配置就用它，没有才退回源码树）。所以"两份不一致"本身已经不会
+    再让调试读到不同的值 —— 但它仍是隐患：换机器/删掉 dist 之后，源码树那份
+    会顶上来，带着过期值运行。这里继续比对，但结论按"是否真的会被读到"分层：
+      · 会继承 dist（现在就是这样）→ 提示性输出，不升 WARN
+      · 不会继承（dist 缺失）→ 源码树那份就是生效配置，此时不一致也无所谓
+    换句话说：只要源码模式继承生效，这个检查就不再是告警项。
     """
     print("[9] 检查配置文件重复")
     dist = ROOT / "dist" / "zerofall_config.json"
@@ -280,13 +288,13 @@ def check_config_duplication():
         print("  [WARN] 配置解析失败: {}".format(e))
         return
     diff = [k for k in set(a) | set(b) if a.get(k) != b.get(k)]
-    if diff:
-        WARN.append("配置双份不一致: {} 项 ({})".format(len(diff), ", ".join(sorted(diff)[:6])))
-        print("  [WARN] dist 与源码树配置有 {} 项不同（以 dist 为现役）：{}".format(
-            len(diff), ", ".join(sorted(diff)[:6])))
-        print("  提示：从源码调试时会读到源码树那份，容易误判；建议保持一致")
-    else:
-        print("  [PASS] 两份配置一致")
+    if not diff:
+        print("  [PASS] 两份配置一致（源码模式继承 dist，避免调试时配置退化）")
+        return
+    print("  [提示] dist 与源码树配置有 {} 项不同：{}".format(
+        len(diff), ", ".join(sorted(diff)[:6])))
+    print("  说明：源码模式已优先读 dist 那份，因此这 {} 项不会再影响调试；".format(len(diff)))
+    print("        源码树那份只在 dist 配置缺失时接管，建议顺手同步或删掉。")
 
 
 def check_syntax_all():
@@ -303,12 +311,19 @@ def check_syntax_all():
             ast.parse(p.read_text(encoding='utf-8'))
         except SyntaxError as e:
             bad.append((p.relative_to(ROOT), e.lineno, e.msg))
+    # 本文件自己被 py_files() 排除了（否则 [1]~[5] 会把自己当被测代码扫），
+    # 但它的语法错误意味着整套自检根本跑不起来 —— 必须在这里单独兜一次。
+    me = ROOT / 'selfcheck.py'
+    try:
+        ast.parse(me.read_text(encoding='utf-8'))
+    except SyntaxError as e:
+        bad.append((me.relative_to(ROOT), e.lineno, e.msg))
     if bad:
         for f, ln, msg in bad:
             FAIL.append('syntax {}:{}'.format(f, ln))
             print('  [FAIL] {}:{} {}'.format(f, ln, msg))
     else:
-        n = len(list(py_files())) + len(list(ROOT.glob('test_*.py')))
+        n = len(list(py_files())) + len(list(ROOT.glob('test_*.py'))) + 1
         PASS.append('syntax')
         print('  [PASS] {} 个文件全部通过'.format(n))
 
@@ -386,6 +401,57 @@ def check_version_consistency():
             found.get('modules/__init__.py', versions[-1])))
 
 
+def check_dsh_profile():
+    """本机 DSH profile 的健康（十项只读诊断）
+
+    为什么放在 selfcheck 里而不是只留 tests：tests 是给改代码的人看的回归，
+    selfcheck 是每次升级/重启前跑的闸。profile 一旦触发 DSH 自动恢复，
+    `dsh.profile.bundles` 会被重置成模板、`cordis.patch.yml` 被覆盖，
+    **全部插件配置静默丢失** —— 这件事只有"重启之前"查才有意义。
+
+    全部只读，不写真实文件；没装 DSH 的机器直接跳过。
+    """
+    print('\n[10] 检查 DSH profile 健康（ZeroFall 的核心职责）')
+    try:
+        from modules import profile_health as ph
+    except Exception as e:  # 模块坏了不该拖死整个自检
+        print('  [SKIP] 无法加载 profile_health：{}'.format(e))
+        return
+
+    home = Path(os.environ.get('DSH_HOME') or (Path.home() / '.dsh'))
+    profile = os.environ.get('ZF_DSH_PROFILE') or 'desktop'
+    profiles_dir = home / 'profiles'
+    if not profiles_dir.is_dir():
+        print('  [SKIP] 本机没有 DSH profile 目录（{}）'.format(profiles_dir))
+        return
+
+    try:
+        rep = ph.run_all(home, profile)
+    except Exception as e:
+        FAIL.append('profile-health 执行失败: {}'.format(e))
+        print('  [FAIL] 执行失败：{}'.format(e))
+        return
+
+    for line in ph.format_lines(rep):
+        print('    ' + line)
+
+    checks = rep.get('checks', [])
+    s = rep.get('summary', {})
+    for c in checks:
+        if c.get('level') == 'error':
+            FAIL.append('profile-error {}: {}'.format(c.get('id'), c.get('detail')))
+        elif c.get('level') == 'warn':
+            WARN.append('profile-warn {}: {}'.format(c.get('id'), c.get('detail')))
+
+    if not s.get('error'):
+        PASS.append('profile-health')
+        print('  [PASS] 没有硬问题：{}（提示 {} 项 / 通过 {} 项）'.format(
+            rep.get('verdict', ''), s.get('info', 0), s.get('ok', 0)))
+    else:
+        print('  [FAIL] 有 {} 项硬问题：{}'.format(s.get('error'), rep.get('verdict', '')))
+        print('  提示：先按每项后面的「→」修掉，再重启 DSH')
+
+
 if __name__ == '__main__':
     print('=' * 70)
     print('ZeroFall 项目自检')
@@ -399,6 +465,7 @@ if __name__ == '__main__':
     check_bare_except_pass()
     check_version_consistency()
     check_config_duplication()
+    check_dsh_profile()
     print()
     print('=' * 70)
     print('通过 {} / 提示 {} / 失败 {}'.format(len(PASS), len(WARN), len(FAIL)))
