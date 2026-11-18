@@ -101,3 +101,7 @@ _stage_*/
 # 本机记录（含绝对路径 / 注册表备份，不进公开仓库）
 Run-key-backup-*.txt
 zerofall-*.md
+# 自检与测试的临时输出（每次跑都会重写，不是源码）
+_selfcheck_out.txt
+_selftest*.log
+_selftest*.txt
