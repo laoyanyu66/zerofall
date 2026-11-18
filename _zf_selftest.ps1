@@ -1,4 +1,4 @@
-param(
+﻿param(
     # 只跑指定的用例（按文件名，不带 .py）。改完一两处想快速复验时省 10 分钟：
     #   .\_zf_selftest.ps1 -Only test_profile_health,test_fix_only
     [string[]]$Only

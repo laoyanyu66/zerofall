@@ -92,9 +92,11 @@ secret_vault.zfv
 测试*.md
 
 # 旁路构建产物（不覆盖正在跑的 dist，验证完就删）
-dist_new/
-build_new/
-build_new_*/
+# 用通配覆盖所有带日期/后缀的备份目录：build_20261118c、dist_20261118d、build_pyi…
+# 它们每个 40-50 MB，同一次构建的副本，进版本库只会把仓库撑爆
+build_*/
+dist_*/
+.backup/
 _stage_*/
 # 本机记录（含绝对路径 / 注册表备份，不进公开仓库）
 Run-key-backup-*.txt

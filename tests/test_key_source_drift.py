@@ -54,6 +54,14 @@ def main():
     # 把自持库指向沙箱，绝不碰真实文件
     os.environ['ZF_DATA_DIR'] = str(sand / 'zfdata')
 
+    # 与真实机器环境隔离：load_credential_env() 是从 dict(os.environ) 起底的，
+    # 本机若本来就带着 OPENCODE_GO_API_KEY，"无 key 时不伪造""诊断如实报无"
+    # 这几条会假失败（2026-11-18 实测：本机环境变量确实有 key）。
+    saved_keys = {k: v for k, v in os.environ.items()
+                  if 'API_KEY' in k.upper() or k.upper().endswith('_TOKEN')}
+    for k in saved_keys:
+        os.environ.pop(k, None)
+
     from modules import secret_store
     from modules.acp_client import load_credential_env, credential_diagnosis
 
@@ -180,6 +188,7 @@ def main():
 
     shutil.rmtree(sand, ignore_errors=True)
     os.environ.pop('ZF_DATA_DIR', None)
+    os.environ.update(saved_keys)      # 恢复真实环境变量，不影响后续脚本
     print()
     print('=' * 62)
     print('通过 {} / {} 项'.format(len(PASS), len(PASS) + len(FAIL)))

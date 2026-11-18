@@ -45,6 +45,10 @@ class _DialogBase(QDialog):
                             Qt.WindowType.Dialog)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setModal(True)
+        # 模态提示框一律置顶：它一出现父窗口就被 disable，
+        # 万一被别的窗口盖住，用户只会看到"主界面灰了、点了没反应"
+        self.setWindowFlags(self.windowFlags() |
+                            Qt.WindowType.WindowStaysOnTopHint)
 
         color, mark, _ = _KIND_STYLE.get(kind, _KIND_STYLE['info'])
 
@@ -239,6 +243,14 @@ QPushButton:hover {{
                           geo.center().y() - self.height() // 2)
             except Exception:
                 pass
+        # 弹窗必须自己抢到前台：无边框 + 半透明窗口在别的窗口后面时，
+        # Windows 不会主动把它提上来，用户只会看到主界面变灰、点什么都没反应
+        # （2026-11-18 实测：崩溃提示框被压在豆包窗口下面，ZeroFall 像"未响应"）
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
 
 
 class _NoticeDialog(_DialogBase):

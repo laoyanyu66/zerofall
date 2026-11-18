@@ -4,6 +4,7 @@ DSH 崩溃日志分类器
 
 ZeroFall 看到 crash-*.log 后，先读内容分类，再选恢复策略：
   - auth_failed   : Web 认证失败 / welcome 握手失败 → 清认证态重登，不要回滚插件
+  - config_error  : profile 补丁文件被写坏（overlay 解析失败 / NUL 字节）→ 修文件，不要回滚插件
   - plugin_error  : 插件/Node 模块错误（EPIPE、dsh-rea-plugin、node_modules）→ 回滚插件快照
   - runtime_error : 运行时/渲染进程崩溃 → 提示用户
   - unknown       : 未知 → 走通用快照选择流程
@@ -37,7 +38,38 @@ _RUNTIME_PATTERNS = [
     re.compile(r'crashpad', re.I),
     re.compile(r'GPU process crashed', re.I),
     re.compile(r'renderer process gone', re.I),
+    re.compile(r'Desktop renderer exited', re.I),
+    re.compile(r'renderer exited:\s*crashed', re.I),
     re.compile(r'out of memory', re.I),
+]
+
+# 配置文件被写坏（overlay / YAML）
+#
+# 2026-11-17 实机连踩三次，宿主在 main() 里 parsePatchList 抛
+# "YAMLException: null byte is not allowed in input"，整个 host 进程退出。
+# 这一类**回滚插件快照完全无效**：插件没坏，是 profile 的 cordis.patch.yml
+# 被写坏了（并发重写 + 强杀/掉电留下半截或 NUL 前缀）。
+# 正确处置是修文件（modules/patch_guard.py），不是回退历史。
+_CONFIG_PATTERNS = [
+    re.compile(r'failed to parse overlay', re.I),
+    re.compile(r'null byte is not allowed', re.I),
+    re.compile(r'yaml ?exception', re.I),
+    re.compile(r'failed to parse [^\s]*\.ya?ml', re.I),
+]
+
+# 宿主启动期就退出了（不是配置坏了、也不是插件报错）
+#
+# 2026-11-18 07:16 那次：main 进程的 AggregateError 里两条 ——
+#   `dsh desktop host stopped: [dsh-purge-community] ...`
+#   和 `host did not exit after SIGKILL`
+# 也就是宿主在启动阶段自己停了，随后清理阶段连 SIGKILL 都没能把它收掉。
+# 这类多半是"上一次换版/换补丁没落地"留下的状态机残留（D:\DeepSeek\resources
+# 下的 app.asar.rename-pending / app.asar.purge-handoff.json），重试一次往往能过；
+# 连续两次都这样才值得回滚。
+_HOST_PATTERNS = [
+    re.compile(r'dsh desktop host stopped', re.I),
+    re.compile(r'host did not exit after SIGKILL', re.I),
+    re.compile(r'desktop backend startup and cleanup failed', re.I),
 ]
 
 
@@ -51,6 +83,11 @@ def classify_crash_log(text: str) -> Tuple[str, str]:
         if m:
             return ("auth_failed", "Web 认证失败：{}".format(m.group(0)))
 
+    for pat in _CONFIG_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return ("config_error", "配置文件损坏：{}".format(m.group(0)))
+
     for pat in _PLUGIN_PATTERNS:
         m = pat.search(text)
         if m:
@@ -60,6 +97,11 @@ def classify_crash_log(text: str) -> Tuple[str, str]:
         m = pat.search(text)
         if m:
             return ("runtime_error", "运行时崩溃：{}".format(m.group(0)))
+
+    for pat in _HOST_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return ("host_startup", "宿主启动期退出：{}".format(m.group(0)))
 
     return ("unknown", "未识别的崩溃")
 

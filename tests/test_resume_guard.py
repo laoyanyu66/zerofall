@@ -62,7 +62,9 @@ def main():
 
     patch_text = (pdir / "cordis.patch.yml").read_text(encoding="utf-8")
     check("插入的是 insert 列表项", "- id: resume-sessions" in patch_text)
-    check("默认 maxSessions 为 8（多会话一起续跑）", "maxSessions: 8" in patch_text, patch_text[:0])
+    check("默认 maxSessions 为 2（11-17 从 8 收回，避免开机并发多条会话）",
+          "maxSessions: 2" in patch_text, patch_text[:0])
+    check("默认子会话让位", "skipSubagent: true" in patch_text)
     check("默认不只让第一个续跑", "continueOnlyFirst: false" in patch_text)
     check("默认日志上限 8MB", "maxSessionLogMB: 8" in patch_text)
 
@@ -77,7 +79,7 @@ def main():
     check("读到 disabled", rg.plugin_status(pdir)["patch"] == "disabled")
     rep3 = rg.ensure_plugin(tmp, "desktop", host_llm=None)
     check("再次自愈成功", rg.plugin_status(pdir)["patch"] == "enabled", rep3["actions"])
-    check("其它配置没被改", "maxSessions: 8" in (pdir / "cordis.patch.yml").read_text(encoding="utf-8"))
+    check("其它配置没被改", "maxSessions: 2" in (pdir / "cordis.patch.yml").read_text(encoding="utf-8"))
 
     print("D. 候选语义：只认 running / active goal")
     now = 1_794_000_000_000
@@ -134,14 +136,17 @@ def main():
     bogus = rg.ensure_plugin(tmp, "nope", host_llm=None)
     check("坏 profile 报错而不是崩溃", bool(bogus["errors"]), bogus)
 
-    print("G. 阈值被改回老默认时自愈（多会话只续跑一个的根因）")
+    print("G. 阈值被改回老默认时自愈（8 = 开机并发多条会话，任务会串）")
     downgraded = (pdir / "cordis.patch.yml").read_text(encoding="utf-8")
-    downgraded = downgraded.replace("maxSessions: 8", "maxSessions: 2")
+    downgraded = downgraded.replace("maxSessions: 2", "maxSessions: 8")
     downgraded = downgraded.replace("continueOnlyFirst: false", "continueOnlyFirst: true")
+    downgraded = downgraded.replace("skipSubagent: true", "skipSubagent: false")
     (pdir / "cordis.patch.yml").write_text(downgraded, encoding="utf-8")
     rep_g = rg.ensure_plugin(tmp, "desktop", host_llm=None)
     txt = (pdir / "cordis.patch.yml").read_text(encoding="utf-8")
-    check("maxSessions 被纠回 8", "maxSessions: 8" in txt, [l for l in txt.splitlines() if "maxSessions" in l])
+    check("maxSessions 被纠回 2", "maxSessions: 2" in txt, [l for l in txt.splitlines() if "maxSessions" in l])
+    check("skipSubagent 被纠回 true", "skipSubagent: true" in txt,
+          [l for l in txt.splitlines() if "skipSubagent" in l])
     check("continueOnlyFirst 被纠回 false", "continueOnlyFirst: false" in txt)
     check("自愈动作有记录", any("阈值" in str(a) for a in rep_g["actions"]), rep_g["actions"])
     rep_g2 = rg.ensure_plugin(tmp, "desktop", host_llm=None)
@@ -174,7 +179,8 @@ def main():
     txt2, acts = rg.ensure_thresholds(
         "root:\n- insert:\n    - id: resume-sessions\n      name: 'x'\n"
         "      config:\n        enabled: true\n        mode: 'continue'\n")
-    check("补了 maxSessions", "maxSessions: 8" in txt2, txt2)
+    check("补了 maxSessions", "maxSessions: 2" in txt2, txt2)
+    check("补了 skipSubagent", "skipSubagent: true" in txt2, txt2)
     check("补了 continueOnlyFirst", "continueOnlyFirst: false" in txt2, txt2)
     check("补键有动作记录", len(acts) >= 2, acts)
     other = "root:\n- id: other\n  config:\n    x: 1\n"
@@ -237,6 +243,49 @@ def main():
         "staleLiveAsInterrupted": False}, now=w_ms)
     check("关掉开关就退回老行为（都不算）",
           all(not r["candidate"] for r in rows_off), [(r["session_id"], r["candidate"]) for r in rows_off])
+
+    print("L. vendor 不被旧 payload 覆盖（11-17 实际踩到的坑）")
+    # 打包版里 payload 每轮解包，mtime 永远是"刚才"，旧判据"vendor 比 payload 新"永远不成立，
+    # 于是启动 4 秒后静默把 vendor 里当天的修复覆盖回旧版。改按哈希标记对账。
+    import tempfile as _tf
+    lroot = Path(_tf.mkdtemp(prefix="rg_vendor_"))
+    lprof = lroot / "profiles" / "desktop"
+    lvendor = lprof / "vendor" / rg.PLUGIN_NAME
+    lvendor.mkdir(parents=True)
+    (lprof / "package.json").write_text(json.dumps({"dependencies": {}}), encoding="utf-8")
+    (lprof / "cordis.patch.yml").write_text("# user layer\n[]\n", encoding="utf-8")
+
+    payload_old = lroot / "payload_old"
+    payload_new = lroot / "payload_new"
+    for d, text in ((payload_old, "// payload-old\n"), (payload_new, "// payload-new\n")):
+        d.mkdir()
+        (d / "index.js").write_text(text, encoding="utf-8")
+
+    (lvendor / "index.js").write_text("// local-fix with sessionLineage\n", encoding="utf-8")
+    orig_payload_dir = rg.payload_dir
+    try:
+        rg.payload_dir = lambda *a, **k: payload_old
+        rep_l = rg.ensure_plugin(lroot, "desktop", host_llm=None)
+    finally:
+        rg.payload_dir = orig_payload_dir
+    kept = (lvendor / "index.js").read_text(encoding="utf-8")
+    check("本地改过的 vendor 不被旧 payload 覆盖", "local-fix" in kept, kept[:40])
+    check("给了「保留 vendor」的警告", any("保留 vendor" in w for w in rep_l["warnings"]), rep_l["warnings"])
+
+    # 原样拷贝（带哈希标记）时，payload 换代必须能升上去
+    (lvendor / "index.js").write_text("// payload-old\n", encoding="utf-8")
+    (lvendor / rg._PAYLOAD_MARKER).write_text(
+        rg._sha256_file(payload_old / "index.js"), encoding="utf-8")
+    try:
+        rg.payload_dir = lambda *a, **k: payload_new
+        rep_l2 = rg.ensure_plugin(lroot, "desktop", host_llm=None)
+    finally:
+        rg.payload_dir = orig_payload_dir
+    upgraded = (lvendor / "index.js").read_text(encoding="utf-8")
+    check("原样拷贝会升到新 payload", "payload-new" in upgraded, upgraded[:40])
+    check("升级后哈希标记同步更新",
+          (lvendor / rg._PAYLOAD_MARKER).read_text(encoding="utf-8").strip()
+          == rg._sha256_file(payload_new / "index.js"))
 
     print(f"\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败")
     if FAIL:

@@ -100,6 +100,10 @@ print('== 2. 同一秒建两份快照不撞 id ==')
 cfg2 = make_env('b')
 mgr2 = sm.SnapshotManager(cfg2)
 a = mgr2.create_snapshot('同秒 A', force_healthy=True)
+# 第二份之前先改一个文件：内容完全一致时会被快照去重拦下（那是另一条用例），
+# 这里要验的是"同一秒内两份内容不同的快照不能撞 id"。
+(Path(cfg2.deepseek_plugins_dir) / 'marker.txt') \
+    .write_text('second', encoding='utf-8')
 b = mgr2.create_snapshot('同秒 B', force_healthy=True)
 check('两份都拿到对象', a is not None and b is not None)
 check('id 不同', a and b and a.snapshot_id != b.snapshot_id, (a and a.snapshot_id, b and b.snapshot_id))

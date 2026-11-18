@@ -30,6 +30,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { randomUUID } from 'node:crypto';
 
 /** 尽量用 DSH 自己的消息构造器；解析不到就退化成结构等价的手写消息。 */
@@ -41,6 +42,30 @@ try {
 }
 
 const SNAPSHOT_VERSION = 2;
+
+/**
+ * 「本次启动真正被接回来的会话」——给 UI 横幅用的清单。
+ *
+ * 判据只看 `restoredAt` 落在本次 boot 之后：
+ *   - 已经活着（alreadyLive）的条目没有 restoredAt —— 那不是"被接回来"；
+ *   - skipped / failed / timeout 同样没有；
+ *   - 反过来只按 status 判断会把上一轮留下的 live 全算进来，重启后一屏历史会话
+ *     都被画成"续跑中"，比不显示更误导。
+ * 抽成模块级纯函数是为了能脱离宿主单测（`tools/check-live.mjs`）。
+ */
+export function liveItems(sessions, bootAt, limit = 12) {
+  const since = Number(bootAt) || 0;
+  return Object.entries(sessions ?? {})
+    .map(([sessionId, entry]) => ({
+      sessionId,
+      title: typeof entry?.title === 'string' ? entry.title : '',
+      status: entry?.status ?? null,
+      restoredAt: Number(entry?.restoredAt) || 0,
+    }))
+    .filter((row) => row.restoredAt > 0 && row.restoredAt >= since)
+    .sort((a, b) => a.restoredAt - b.restoredAt)
+    .slice(0, Math.max(1, Number(limit) || 12));
+}
 const STATE_FILE = 'resume-sessions.json';
 const LOG_PREFIX = '[resume-sessions]';
 /** 启动窗口瞬态失败最多试几次（含首轮）。 */
@@ -106,6 +131,16 @@ const DEFAULTS = {
    * 表现出来又是"只接上一个"。
    */
   anyWorkspace: true,
+  /**
+   * 启动时是否跳过**子会话**（`origin: subagent` / 带 `parentSession`）。
+   *
+   * 为什么要跳过（2026-11-17）：子会话是主会话委派出来的，它的"半截活"由父会话负责
+   * 续上；把它们各自拉起来，结果是开机就并发好几条看似重复的会话（实测 11 条
+   * 全挂在同一个父会话 9ab91ab9 下，每条只有 1 条答复）。父会话活着，子会话的
+   * 上下文本来就在父的对话里；父会话死了，子会话单独续也接不回去。
+   * 所以默认 true：只要父会话在候选里，子会话不占名额。
+   */
+  skipSubagent: true,
   /**
    * 上个进程留下的 live / restored 条目，按"上个进程消失的时刻"重新判定。
    *
@@ -181,6 +216,7 @@ function normalizeConfig(raw) {
     includeGoalActive: cfg.includeGoalActive !== false,
     rearmGoals: cfg.rearmGoals !== false,
     workspacePath: typeof cfg.workspacePath === 'string' ? cfg.workspacePath.trim() : '',
+    skipSubagent: cfg.skipSubagent !== false,
     verbose: cfg.verbose !== false,
   };
 }
@@ -210,6 +246,46 @@ function isBlankSession(sessionId) {
   // 没有会话元数据但有 outline 的会话按 outline 判断；两者都读不到就不当空白。
   if (meta && turns.length === 0 && (typeof first !== 'string' || first.trim() === '')) return true;
   return false;
+}
+
+/**
+ * 这条会话是不是**子会话**（主会话委派出来的）。
+ *
+ * 只看会话日志的第一帧（`type: "session"`，带 origin / parentSession），
+ * 不解整份日志 —— 启动期每个候选都整份读一遍会明显拖慢（有的日志 8MB）。
+ */
+function sessionLineage(sessionId) {
+  const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+  const root = path.join(homeDir(), 'sessions');
+  let dirs = [];
+  try {
+    for (const workspace of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!workspace.isDirectory()) continue;
+      dirs.push(path.join(root, workspace.name, sessionId));
+    }
+  } catch {
+    return { subagent: false, parent: '' };
+  }
+  for (const dir of dirs) {
+    let buf;
+    try {
+      buf = fs.readFileSync(path.join(dir, 'session.v4.jsonl.zstd'));
+    } catch {
+      continue;
+    }
+    const at = buf.indexOf(magic);
+    if (at < 0) continue;
+    const next = buf.indexOf(magic, at + 4);
+    try {
+      const text = zlib.zstdDecompressSync(buf.subarray(at, next < 0 ? buf.length : next)).toString('utf8');
+      const head = JSON.parse(text.split('\n')[0]);
+      const parent = typeof head?.parentSession === 'string' ? head.parentSession : '';
+      if (head?.origin === 'subagent' || parent !== '') return { subagent: true, parent };
+    } catch {
+      /* 帧坏了就当不是子会话，交给后面的判据 */
+    }
+  }
+  return { subagent: false, parent: '' };
 }
 
 /** 该会话日志的总字节数（resume 会把它整份读进内存，太大就跳过）。 */
@@ -642,12 +718,25 @@ export function apply(ctx, rawConfig) {
       .filter(([, entry]) => force || maxAge === 0 || now - (Number(entry.at) || 0) <= maxAge)
       .filter(([, entry]) => target === '' || samePath(entry.cwd, target))
       .sort((a, b) => (Number(b[1].runningAt) || Number(b[1].at) || 0) - (Number(a[1].runningAt) || Number(a[1].at) || 0));
+    /**
+     * 子会话让位：父会话也在候选里时，子会话不再单独占一个名额。
+     * 父会话会把这条线继续跑下去；两边都拉起来就是"开机同时跑两条同一件事"。
+     * 父会话不在候选里（它已经结束/被归档）时，子会话仍按正常规则处理。
+     */
+    const candidateIds = new Set(rows.map(([id]) => id));
+    const kept = cfg.skipSubagent === false
+      ? rows
+      : rows.filter(([id]) => {
+        const lineage = sessionLineage(id);
+        if (lineage.subagent === false) return true;
+        return lineage.parent === '' || !candidateIds.has(lineage.parent);
+      });
     // 崩溃降级：连续两次在恢复时把进程带走，就不再自动恢复（手动接口仍然可用）。
     const limit = force === true
       ? Math.max(1, cfg.maxSessions)
       : (guard.crashes >= 2 ? 0 : guard.crashes === 1 ? 1 : Math.max(0, cfg.maxSessions));
-    log(`候选 ${rows.length} 个（工作区=${target || '未限定'}，上限 ${limit}${guard.crashes ? `，崩溃降级 ${guard.crashes} 级` : ''}）`);
-    return rows.slice(0, limit);
+    log(`候选 ${rows.length} 个（子会话让位后 ${kept.length} 个；工作区=${target || '未限定'}，上限 ${limit}${guard.crashes ? `，崩溃降级 ${guard.crashes} 级` : ''}）`);
+    return kept.slice(0, limit);
   }
 
   // ── 3. 恢复 ───────────────────────────────────────────────────────────────
@@ -1246,6 +1335,40 @@ export function apply(ctx, rawConfig) {
         },
       });
 
+      /**
+       * 「此时在续跑的是哪几条」——给 UI 一眼可见的横幅用。
+       *
+       * 判据只看 `restoredAt` 落在**本次启动**（state.boot.at）之后：
+       *   - 已经活着（alreadyLive）的会话没有 restoredAt，不算"被接回来"；
+       *   - 跳过 / 失败 / timeout 的也没有，不该画成"续跑中"；
+       * 反过来只用 status 判断会把上一轮的 live 也算进来 —— 重启后一屏历史会话
+       * 全被标成"续跑中"，比不显示更糟。
+       */
+      webServer.register({
+        kind: 'exact',
+        path: '/resume-sessions/live',
+        handler: (req, res) => {
+          const bootAt = Number(state.boot?.at) || 0;
+          const items = liveItems(state.sessions, bootAt, 12);
+          send(res, 200, {
+            ok: true,
+            pid: state.boot?.pid ?? null,
+            phase: state.phase ?? null,
+            restoring: state.boot?.restoring === true,
+            startedAt: Number(state.restoreStartAt) || 0,
+            endAt: Number(state.lastRestoreEndAt) || 0,
+            maxSessions: cfg.maxSessions,
+            items,
+            counts: {
+              live: items.length,
+              retry: Array.isArray(lastReport?.retried) ? lastReport.retried.length : 0,
+              failed: Array.isArray(lastReport?.failed) ? lastReport.failed.length : 0,
+              skipped: Array.isArray(lastReport?.skipped) ? lastReport.skipped.length : 0,
+            },
+          });
+        },
+      });
+
       webServer.register({
         kind: 'exact',
         path: '/resume-sessions/restore',        handler: async (req, res) => {
@@ -1258,7 +1381,7 @@ export function apply(ctx, rawConfig) {
         },
       });
 
-      log('HTTP 路由就绪：/resume-sessions/state、/resume-sessions/restore');
+      log('HTTP 路由就绪：/resume-sessions/state、/resume-sessions/live、/resume-sessions/restore');
     });
   });
 }

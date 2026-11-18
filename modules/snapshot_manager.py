@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 import sys
+import threading
 sys.path.append(str(Path(__file__).parent.parent))
 from config import ZeroFallConfig
 from logger import ZeroFallLogger
@@ -96,6 +97,40 @@ def _is_skippable_dir(name: str) -> bool:
 # 安全性不变：只有 (size, sha256) 完全相同才省，且恢复时一律先 materialize_dedup() 补回。
 DEDUPE_MIN_BYTES = 4 * 1024        # 2026-11-16 二次自检：256 KB → 4 KB
 DEDUPE_MANIFEST_NAME = "_zf_dedup.json"
+
+# 跨快照"内容指纹"登记表：`{snapshot_id: sha256}`。
+# 存在的理由：文件级去重只在**一份快照内部**省重复文件，跨时间的两份快照即使一模一样，
+# 也各存一整个包。实测 58 份 × 14.8 MB ≈ 2.68 GB，而 20:31 / 20:40 / 20:41 三份几乎相同。
+# 记下指纹之后，内容没变时直接跳过这一份（不压缩、不占盘）。
+CONTENT_SIG_NAME = "_zf_content_sigs.json"
+
+
+def _content_signature(root: Path) -> str:
+    """目录内容指纹：相对路径 + 文件内容，按名称排序后算 sha256。
+
+    为什么按内容而不是 mtime：最初写的是"路径 + 字节数 + mtime"，实测拿现成的 55 份
+    快照索引一比，**没有两份的包级 md5 是相同的** —— 因为它们相隔几分钟，期间总有
+    文件被重写、mtime 变了，可内容其实一样。按 mtime 的指纹因此几乎永不命中。
+    改按内容之后，48 MB 的快照目录算一次约 0.3 秒，换来的是"内容真没变就省下 15 MB"。
+    """
+    root = Path(root)
+    h = hashlib.sha256()
+    try:
+        for base, dirs, files in os.walk(root):
+            dirs.sort()
+            for name in sorted(files):
+                p = Path(base) / name
+                try:
+                    rel = str(p.relative_to(root)).replace("\\", "/")
+                    h.update(rel.encode("utf-8") + b"\n")
+                    with open(p, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                            h.update(chunk)
+                except OSError:
+                    continue
+    except OSError:
+        return ""
+    return h.hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
@@ -489,6 +524,9 @@ class SnapshotData:
         data['plugins'] = [PluginInfo(**p) for p in data.get('plugins', [])]
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
+CREATE_LOCK_TIMEOUT = 180   # 等锁上限（秒）：正常一份完整快照 40 秒内写完
+
+
 class SnapshotManager:
     """快照管理器"""
     
@@ -500,6 +538,9 @@ class SnapshotManager:
         self.snapshots: Dict[str, SnapshotData] = {}
         # 本进程删除过的 ID：保存索引时不要把磁盘上的旧条目又合并回来
         self._deleted_ids = set()
+        # 快照创建互斥锁：轻量快照 / 每日完整快照 / 崩溃快照 / 手动快照
+        # 都可能在不同线程同时进来，必须串行写盘（见 create_snapshot 注释）
+        self._create_lock = threading.Lock()
         self._load_index()
     
     def _load_index(self):
@@ -853,7 +894,37 @@ class SnapshotManager:
     def create_snapshot(self, notes: str = "", force_healthy: bool = False,
                         include_runtime: bool = False,
                         is_full: bool = None,
-                        include_sessions: bool = None) -> Optional[SnapshotData]:
+                        include_sessions: bool = None,
+                        wait_seconds: float = 30.0) -> Optional[SnapshotData]:
+        """互斥入口：同一时刻只允许一份快照在写盘
+
+        2026-11-18 实测（D:\\zerofall\\logs\\zerofall_20261118.log）：
+        07:16:14 轻量快照和每日完整快照在同一秒各起一个线程，两边算出同一个
+        snapshot_id、同时往同一个目标目录 copy2，撞出
+        `[WinError 32] 另一个程序正在使用此文件`，然后原地重试了 37 秒才收场
+        （正常 144 MB 一份只要 2 秒）。加锁之后第二个任务进来时目录已存在，
+        会自然顺延到下一秒，不再互相踩。
+
+        wait_seconds: 等锁上限。定时/静默快照等不到就直接跳过（下一轮再来），
+        恢复前的自动备份用 CREATE_LOCK_TIMEOUT 长等，不能省那一步。
+        """
+        if not self._create_lock.acquire(timeout=wait_seconds):
+            ZeroFallLogger.warning(
+                "已有快照任务在写盘（等待 {:.0f}s 未拿到锁），本次创建跳过 | notes={}".format(
+                    wait_seconds, notes))
+            return None
+        try:
+            return self._create_snapshot_impl(
+                notes=notes, force_healthy=force_healthy,
+                include_runtime=include_runtime,
+                is_full=is_full, include_sessions=include_sessions)
+        finally:
+            self._create_lock.release()
+
+    def _create_snapshot_impl(self, notes: str = "", force_healthy: bool = False,
+                              include_runtime: bool = False,
+                              is_full: bool = None,
+                              include_sessions: bool = None) -> Optional[SnapshotData]:
         """创建快照
 
         Args:
@@ -1022,6 +1093,22 @@ class SnapshotManager:
             
             # 计算快照大小
             size_mb = get_directory_size(str(snapshot_path))
+
+            # 跨快照去重：内容跟上一份完全一致时，不必再产一份 14.8 MB 的包。
+            # 只对轻量快照做（完整快照是定时恢复点，仍然照打），崩溃现场也不跳过。
+            content_sig = ""
+            if not full_flag and '崩溃' not in (notes or ''):
+                try:
+                    content_sig = _content_signature(snapshot_path)
+                    prev = self._latest_content_sig()
+                    if content_sig and prev and content_sig == prev[1]:
+                        shutil.rmtree(snapshot_path)
+                        ZeroFallLogger.info(
+                            "[快照去重] 内容与 {} 完全一致，本次跳过".format(prev[0])
+                        )
+                        return self.snapshots.get(prev[0])
+                except Exception as _dup_err:
+                    ZeroFallLogger.debug("快照去重判断跳过: {}".format(_dup_err))
             
             # 记下源机器路径：恢复时用来改写旧前缀（换机/改用户名）
             try:
@@ -1068,6 +1155,8 @@ class SnapshotManager:
             # 保存到索引
             self.snapshots[snapshot_id] = snapshot_data
             self._save_index()
+            if content_sig:
+                self._record_content_sig(snapshot_id, content_sig)
             
             ZeroFallLogger.snapshot_created(snapshot_id, size_mb, len(plugins))
             self._write_restore_script(archive_path, snapshot_id)
@@ -1079,6 +1168,24 @@ class SnapshotManager:
             
         except Exception as e:
             ZeroFallLogger.error(f"创建快照失败: {e}")
+            # 失败也要把半成品收掉：一次复制是几十 MB 的目录 + 一个没写完的 zip。
+            # 启动清理（"[启动清理] 临时目录/截断包"）确实能扫到，但那要等下一次启动；
+            # 运行期间反复失败就是几十分钟内白占几十 MB。
+            # 只在"索引里还没有这份"时删 —— 索引已写入说明包已成功、报错出在收尾步骤，
+            # 那时删包等于把一份好快照弄丢。
+            sid = locals().get('snapshot_id')
+            if sid and sid not in self.snapshots:
+                for p in (locals().get('snapshot_path'), locals().get('archive_path')):
+                    try:
+                        if not p or not Path(p).exists():
+                            continue
+                        if Path(p).is_dir():
+                            shutil.rmtree(p)
+                        else:
+                            Path(p).unlink()
+                        ZeroFallLogger.info("[快照] 已清理失败残留：{}".format(p))
+                    except Exception:
+                        pass
             return None
     
     # 恢复时不能清理的目录（运行时/缓存/日志/附件，不属于"环境状态"）
@@ -1088,7 +1195,46 @@ class SnapshotManager:
         'logs', 'node_modules', '.cache', 'attachments', 'backups',
         '.DS_Store', 'Thumbs.db',
     }
-    
+
+    # ---------- 跨快照内容指纹 ----------
+
+    def _content_sigs_path(self) -> Path:
+        return Path(self.snapshot_dir) / CONTENT_SIG_NAME
+
+    def _load_content_sigs(self) -> Dict[str, str]:
+        try:
+            return json.loads(self._content_sigs_path().read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+
+    def _latest_content_sig(self) -> Optional[Tuple[str, str]]:
+        """最新一份"带指纹且包还在"的快照：(snapshot_id, 指纹)。"""
+        sigs = self._load_content_sigs()
+        cands = []
+        for sid, sig in sigs.items():
+            data = self.snapshots.get(sid)
+            if not data:
+                continue
+            try:
+                if Path(data.archive_path).exists():
+                    cands.append((sid, sig))
+            except OSError:
+                continue
+        if not cands:
+            return None
+        return max(cands, key=lambda kv: str(self.snapshots[kv[0]].created_at or ""))
+
+    def _record_content_sig(self, snapshot_id: str, sig: str) -> None:
+        """记下这份快照的内容指纹；顺手清掉已删除快照的条目。"""
+        try:
+            sigs = self._load_content_sigs()
+            sigs[snapshot_id] = sig
+            sigs = {k: v for k, v in sigs.items() if k in self.snapshots}
+            self._content_sigs_path().write_text(
+                json.dumps(sigs, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            ZeroFallLogger.debug("内容指纹写入失败: {}".format(e))
+
     def _prune_extra_entries(self, snapshot_dir: Path, target_dir: Path) -> List[str]:
         """把 target 中"快照里没有"的顶层条目移到备份区，实现真正的回到快照状态
         
@@ -1234,7 +1380,9 @@ class SnapshotManager:
             # 恢复前备份当前环境（自愈路径已有崩溃快照，可跳过避免重复堆积）
             backup_snapshot = None
             if not skip_pre_restore_backup:
-                backup_snapshot = self.create_snapshot("恢复前自动备份", force_healthy=False)
+                backup_snapshot = self.create_snapshot(
+                    "恢复前自动备份", force_healthy=False,
+                    wait_seconds=CREATE_LOCK_TIMEOUT)
             
             # 根据模式恢复
             if mode == RestoreMode.PLUGIN_ONLY or mode == RestoreMode.FULL_RESTORE:
@@ -1324,6 +1472,9 @@ class SnapshotManager:
             # 恢复后自动重建 profile 依赖（node_modules 已被排除，需 pnpm install 秒级重建）
             if mode in (RestoreMode.PLUGIN_ONLY, RestoreMode.FULL_RESTORE):
                 self._ensure_profile_deps()
+                # 恢复会把 profiles/storages 带回快照那天：守卫的修复、归档集都可能一起回退。
+                # 立刻跑一次只读自检，把"回退到什么状态"写进日志，而不是等人自己想起来。
+                self._post_restore_guardian_check()
             
             # 清理临时目录
             shutil.rmtree(temp_dir)
@@ -1335,6 +1486,42 @@ class SnapshotManager:
             ZeroFallLogger.error(f"恢复快照失败: {e}")
             return False
     
+    def _post_restore_guardian_check(self) -> None:
+        """恢复后跑一次守卫的只读自检（doctor + tidy 干跑），结果写进日志。
+
+        为什么值得：`restore -m full` 会把 `profiles`（含守卫/续跑插件的修复）和
+        `storages`（含归档集）整体带回快照那天的状态 —— 也就是说，恢复一次可能
+        把"会话不串"的那些修复和 200 多条归档一起退回去。这件事不该靠人记着。
+        这里只跑只读命令，不做任何写操作；失败也只记一行警告。
+        """
+        try:
+            import subprocess
+            try:
+                from modules import session_repair as _sr
+            except ImportError:                      # pragma: no cover
+                from . import session_repair as _sr
+            home = str(getattr(self.config, 'deepseek_plugins_dir', '') or '')
+            # 2026-11-18 改名：插件目录 dsh-guardian → dsh-tianheng（CLI 文件名仍是 guardian.mjs，兼容入口保留）
+            cli = Path(home) / "profiles" / "desktop" / "vendor" / "dsh-tianheng" / "bin" / "guardian.mjs"
+            node = _sr.find_node(home)
+            if not node or not cli.is_file():
+                ZeroFallLogger.info("[恢复] 未找到天衡 CLI，跳过恢复后自检")
+                return
+            for sub, label in (("doctor", "自检"), ("tidy", "去重干跑")):
+                try:
+                    r = subprocess.run([node, str(cli), sub], capture_output=True, text=True,
+                                       timeout=300, encoding="utf-8", errors="replace")
+                    text = (r.stdout or "").strip()
+                    last = text.splitlines()[-1] if text else (r.stderr or "")[-160:]
+                    if sub == "doctor" and "失败 0" not in text:
+                        ZeroFallLogger.warning("[恢复] 守卫自检有失败项：{}".format(last))
+                    else:
+                        ZeroFallLogger.info("[恢复] 守卫{}：{}".format(label, last))
+                except Exception as e:
+                    ZeroFallLogger.warning("[恢复] 守卫{}跑不起来: {}".format(label, e))
+        except Exception as e:
+            ZeroFallLogger.warning("[恢复] 恢复后自检跳过: {}".format(e))
+
     def _ensure_profile_deps(self) -> bool:
         """恢复后确保 profile 依赖完整
         

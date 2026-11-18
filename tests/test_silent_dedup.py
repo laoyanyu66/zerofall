@@ -38,6 +38,7 @@ class Cfg:
 class H:
     _should_skip_unchanged_snapshot = MW._should_skip_unchanged_snapshot
     _current_content_fingerprint = MW._current_content_fingerprint
+    _mark_light_baseline = MW._mark_light_baseline
     _newest_light_time = MW._newest_light_time
 
     def __init__(self, fp, skip=True, newest=None, gap_h=6):
@@ -83,7 +84,18 @@ def main():
     h4._last_light_fingerprint = 'x'
     chk(h4._should_skip_unchanged_snapshot() is False, '异常时照打不崩')
 
-    print("G. 兜底：指纹一直没变，但超过 N 小时没打 → 补一份")
+    print("G. 变更点快照打完 → 紧接着的静默快照必须跳过（2026-11-18）")
+    h8 = H('EEEE5555')
+    chk(h8._should_skip_unchanged_snapshot() is False, '首次照打并记基准')
+    h8._mark_light_baseline('EEEE5555')
+    chk(h8._should_skip_unchanged_snapshot() is True, '变更点之后的静默快照 → 跳过',
+        getattr(h8, '_last_light_fingerprint', None))
+    h9 = H('EEEE5555')
+    h9._last_light_fingerprint = 'OLDOLD00'
+    h9._mark_light_baseline('EEEE5555')
+    chk(h9._should_skip_unchanged_snapshot() is True, '基准被刷新成改动后的指纹')
+
+    print("H. 兜底：指纹一直没变，但超过 N 小时没打 → 补一份")
     from datetime import datetime, timedelta
     h5 = H('DDDD4444', newest=datetime.now() - timedelta(hours=7))
     h5._last_light_fingerprint = 'DDDD4444'

@@ -72,7 +72,17 @@ def _ts0(value) -> float:
 
 class ZeroFallMainWindow(QMainWindow):
     """ZeroFall主窗口"""
-    
+
+    # ── 跨线程回调桥 ──
+    # guardian 的监控线程不是 Qt 线程：在那里调 QTimer.singleShot 建出来的
+    # 定时器绑在没有事件循环的线程上，永远不会触发。2026-11-18 实测：
+    # 07:16:07 DeepSeek 退出 → 07:16:28 日志已经写了「ZeroFall 跟随关闭」，
+    # 但 quit 一次都没执行，进程带着一个灰掉的主窗口一直驻留。
+    # 现在监控线程只 emit 信号，Qt 自己会把调用排到 GUI 线程执行。
+    _sig_deepseek_exit = pyqtSignal(int)
+    _sig_deepseek_crash = pyqtSignal(int)
+    _sig_health_probe = pyqtSignal(str)
+
     def __init__(self, config_manager: ConfigManager):
         super().__init__()
         
@@ -105,9 +115,15 @@ class ZeroFallMainWindow(QMainWindow):
         self.guardian = Guardian(self.config, self.env_checker, self.snapshot_manager)
         self.baidu_pan = BaiduPanClient(self.config) if self.config.baidu_pan_enabled else None
         
-        # 设置回调
-        self.guardian.set_crash_callback(self._on_deepseek_crash)
-        self.guardian.set_exit_callback(self._on_deepseek_exit)
+        # 设置回调：监控线程 → 信号 → GUI 线程（不能直接把 Qt 槽挂给线程）
+        self._sig_deepseek_exit.connect(
+            self._on_deepseek_exit, Qt.ConnectionType.QueuedConnection)
+        self._sig_deepseek_crash.connect(
+            self._on_deepseek_crash, Qt.ConnectionType.QueuedConnection)
+        self._sig_health_probe.connect(
+            self._apply_health_badge, Qt.ConnectionType.QueuedConnection)
+        self.guardian.set_crash_callback(self._sig_deepseek_crash.emit)
+        self.guardian.set_exit_callback(self._sig_deepseek_exit.emit)
         
         # ── 快照对比状态 ──
         self._compare_first_id: Optional[str] = None
@@ -131,6 +147,11 @@ class ZeroFallMainWindow(QMainWindow):
         
         # 快照任务占用标记（后台执行，避免 UI 冻结）
         self._snapshot_busy = False
+
+        # 退出只允许发起一次（guardian 可能重复回调）
+        self._exit_requested = False
+        # 环境健康度探测占用标记（冷启动 run_full_check 要 10 秒以上，必须后台跑）
+        self._health_probe_busy = False
         
         # 快照生命周期：累计轻量快照数（每 N 个触发一个完整快照）
         self._light_since_full = 0
@@ -345,6 +366,65 @@ class ZeroFallMainWindow(QMainWindow):
         return card
     
     @staticmethod
+    def _probe_health_async(self):
+        """后台探测环境健康度
+
+        原来这里在 UI 线程里直接 run_full_check(use_cache=True)：
+        冷启动首次没有缓存，实测要 10~13 秒（2026-11-18 日志 07:14:23→07:14:34），
+        主窗口构造期间把事件循环整个憋住，Windows 5 秒就判「未响应」。
+        现在先挂「检测中」，后台算完再 emit 回 GUI 线程刷标签。
+        """
+        if getattr(self, "_health_probe_busy", False):
+            return
+        self._health_probe_busy = True
+        try:
+            self.dash_health_icon.setText("⏳")
+            self.dash_health_text.setText("检测中…")
+            self.dash_health_text.setStyleSheet(
+                "font-size: 14px; color: #888;")
+        except Exception:
+            pass
+
+        def _work():
+            try:
+                report = self.env_checker.run_full_check(use_cache=True, auto=True)
+                val = report.overall_result.value
+            except Exception:
+                val = "error"
+            try:
+                self._sig_health_probe.emit(str(val))
+            except Exception:
+                self._health_probe_busy = False
+
+        threading.Thread(target=_work, daemon=True,
+                         name="ZeroFall-HealthProbe").start()
+
+    def _apply_health_badge(self, result_val: str):
+        """把后台算出来的健康度刷到 Dashboard（GUI 线程）"""
+        try:
+            if result_val == "passed":
+                self.dash_health_icon.setText("✅")
+                self.dash_health_text.setText("健康")
+                self.dash_health_text.setStyleSheet(
+                    "font-size: 14px; color: #00ff88;")
+            elif result_val == "warning":
+                self.dash_health_icon.setText("⚠️")
+                self.dash_health_text.setText("有警告")
+                self.dash_health_text.setStyleSheet(
+                    "font-size: 14px; color: #ffaa00;")
+            elif result_val == "error":
+                self.dash_health_icon.setText("🔍")
+                self.dash_health_text.setText("检测失败")
+                self.dash_health_text.setStyleSheet(
+                    "font-size: 14px; color: #888;")
+            else:
+                self.dash_health_icon.setText("❌")
+                self.dash_health_text.setText("异常")
+                self.dash_health_text.setStyleSheet(
+                    "font-size: 14px; color: #ff4444;")
+        finally:
+            self._health_probe_busy = False
+
     def _refresh_dashboard(self):
         """刷新 Dashboard 所有卡片数据"""
         try:
@@ -378,25 +458,9 @@ class ZeroFallMainWindow(QMainWindow):
                 self.dash_launch_btn.setText("🚀 启动DeepSeek")
             
             # ── 环境健康度 ──
-            try:
-                report = self.env_checker.run_full_check(use_cache=True, auto=True)
-                result_val = report.overall_result.value
-                if result_val == "passed":
-                    self.dash_health_icon.setText("✅")
-                    self.dash_health_text.setText("健康")
-                    self.dash_health_text.setStyleSheet("font-size: 14px; color: #00ff88;")
-                elif result_val == "warning":
-                    self.dash_health_icon.setText("⚠️")
-                    self.dash_health_text.setText("有警告")
-                    self.dash_health_text.setStyleSheet("font-size: 14px; color: #ffaa00;")
-                else:
-                    self.dash_health_icon.setText("❌")
-                    self.dash_health_text.setText("异常")
-                    self.dash_health_text.setStyleSheet("font-size: 14px; color: #ff4444;")
-            except Exception:
-                self.dash_health_icon.setText("🔍")
-                self.dash_health_text.setText("检测失败")
-                self.dash_health_text.setStyleSheet("font-size: 14px; color: #888;")
+            # 注意：这里原来同步跑 run_full_check（冷启动 10s+），已挪到后台线程，
+            # 结果通过 _sig_health_probe 回到 GUI 线程刷新，见 _apply_health_badge
+            self._probe_health_async()
             
             # ── 快照数据 ──
             snapshots = self.snapshot_manager.get_snapshot_list()
@@ -2394,7 +2458,7 @@ class ZeroFallMainWindow(QMainWindow):
                     ZeroFallLogger.info(
                         "[变更检测] 指纹持续变化超 {} 分钟，先拍一份快照止血"
                         .format(max(1, int(cap_s // 60))))
-                    self._create_drift_snapshot()
+                    self._create_drift_snapshot(fp)
                     return
 
                 detail = getattr(self, '_log_drift_detail', None)
@@ -2422,7 +2486,7 @@ class ZeroFallMainWindow(QMainWindow):
 
             self._drift_changed_at = None
             self._drift_first_changed_at = None
-            self._create_drift_snapshot()
+            self._create_drift_snapshot(fp)
         except Exception as e:
             ZeroFallLogger.warning("[变更检测] 检查异常: {}".format(e))
 
@@ -2452,8 +2516,13 @@ class ZeroFallMainWindow(QMainWindow):
         except Exception as e:
             ZeroFallLogger.warning("[变更检测] 差异定位失败: {}".format(e))
 
-    def _create_drift_snapshot(self):
-        """因检测到改动而打快照（后台线程，避免卡 UI）"""
+    def _create_drift_snapshot(self, fingerprint: str = ''):
+        """因检测到改动而打快照（后台线程，避免卡 UI）
+
+        fingerprint 是触发这次改动的"改动后指纹"。打完这份，内容基准就是它了，
+        要立刻记下来：紧跟着的定时静默快照不该再把同一份内容拍第二遍。
+        （实测 10:13 变更点 → 10:14 静默、12:39 变更点 → 12:41 静默，各多一份 37 MB）
+        """
         import threading
         self._snapshot_busy = True
         # 记下这次真正打出快照的时刻，供下次冷却判断
@@ -2468,6 +2537,7 @@ class ZeroFallMainWindow(QMainWindow):
                 if snap:
                     ZeroFallLogger.info(
                         "[变更检测] 已创建变更点快照 {}".format(snap.snapshot_id))
+                    self._mark_light_baseline(fingerprint)
                     QTimer.singleShot(0, lambda s=snap.snapshot_id:
                                       self.statusBar().showMessage(
                                           "检测到环境改动，已创建快照 {}".format(s), 12000))
@@ -2631,6 +2701,21 @@ class ZeroFallMainWindow(QMainWindow):
         except Exception:
             return ''
 
+    def _mark_light_baseline(self, fingerprint: str = ''):
+        """把"当前内容"记为静默快照的比对基准
+
+        两条路都要记：定时静默快照打完之后、变更点快照打完之后。
+        只记前者的话，变更点快照后面紧跟着的那次定时快照会因为基准还停在
+        "改动前"而再拍一份同样的内容 —— 2026-11-18 实测 10:13→10:14、
+        12:39→12:41 各多一份 37 MB。
+        """
+        try:
+            self._last_light_fingerprint = (fingerprint
+                                            or self._current_content_fingerprint()
+                                            or getattr(self, '_last_light_fingerprint', None))
+        except Exception:
+            pass
+
     def _should_skip_unchanged_snapshot(self) -> bool:
         """静默快照要不要因为"内容没变"而跳过
 
@@ -2720,11 +2805,7 @@ class ZeroFallMainWindow(QMainWindow):
             return
         ZeroFallLogger.info("静默快照创建成功: {}".format(snap.snapshot_id))
         # 记下这一份的内容指纹，下一轮拿它比对
-        try:
-            self._last_light_fingerprint = self._current_content_fingerprint() or \
-                getattr(self, '_last_light_fingerprint', None)
-        except Exception:
-            pass
+        self._mark_light_baseline()
         self._notify_snapshot_tab()
         
         # 2) 完整快照触发：定时模式下由 _check_full_snapshot_interval 负责，
@@ -4188,9 +4269,8 @@ class ZeroFallMainWindow(QMainWindow):
         _th_doubao.Thread(target=_work, daemon=True, name="ZeroFall-DoubaoRelay").start()
 
     def _on_deepseek_crash(self, exit_code: int):
-        """DeepSeek崩溃回调（在监控线程中调用，必须切回主线程处理 UI）"""
+        """DeepSeek崩溃回调（已由 _sig_deepseek_crash 队列到 GUI 线程执行）"""
         ZeroFallLogger.critical("DeepSeek 崩溃，退出码: {}".format(exit_code))
-        # QTimer.singleShot 线程安全，会投递到主线程事件循环
         QTimer.singleShot(0, lambda: self._handle_crash_on_main(exit_code))
     
     def _handle_crash_on_main(self, exit_code: int):
@@ -4317,6 +4397,97 @@ class ZeroFallMainWindow(QMainWindow):
                             ZeroFallLogger.info("[认证态] 已清理 {} 项".format(len(cleared)))
                             self._rollback_count = 0
                             QTimer.singleShot(1500, self.auto_launch_deepseek)
+                        return
+                    if _cat == "config_error":
+                        # profile 的 cordis.patch.yml 被写坏（NUL / 截断）：
+                        # 宿主在 parsePatchList 里直接 fatal，和插件一点关系没有 ——
+                        # 回滚插件快照只会在旧配置上再崩一次，还顺手把好的改动带走。
+                        # 正确处置：就地修文件，修好直接重启。
+                        try:
+                            from modules.patch_guard import ensure as _ensure_patch
+                            _home = getattr(self.config, "deepseek_plugins_dir", "") or ""
+                            _rep = _ensure_patch(
+                                home=Path(_home) if _home and Path(_home).is_dir() else None)
+                        except Exception as _pe:      # noqa: BLE001 - 修不了也要给出人话
+                            _rep = {"repaired": [], "bad": [], "checks": [], "error": str(_pe)}
+                        _fixed = _rep.get("repaired") or []
+                        if _fixed:
+                            ZeroFallLogger.info(
+                                "[崩溃自愈] 补丁文件已修复 {} 份：{}".format(
+                                    len(_fixed),
+                                    "、".join(Path(r["profile"]).name for r in _fixed)))
+                            try:
+                                from modules.fault_timeline import record as _record
+                                _record("crash_selfheal",
+                                        "配置损坏已自动修复 {} 份，随后重启".format(len(_fixed)))
+                            except Exception:
+                                pass
+                            QMessageBox.information(
+                                self, "配置文件已自动修复",
+                                "DeepSeek 崩溃原因：{}\n\n"
+                                "不是插件问题：profile 的 cordis.patch.yml 被写坏了"
+                                "（混进 NUL 字节，或写到一半被截断），\n"
+                                "宿主解析 overlay 时直接退出。\n\n"
+                                "ZeroFall 已用最近的完好备份顶回 {} 份，坏文件留档为 "
+                                "bak-invalid-*。\n现在重启 DeepSeek，不需要回滚快照。".format(
+                                    _reason, len(_fixed)))
+                            self._rollback_count = 0
+                            QTimer.singleShot(1500, self.auto_launch_deepseek)
+                            return
+                        ZeroFallLogger.warning("[崩溃自愈] 补丁文件异常但没有可用备份")
+                        QMessageBox.warning(
+                            self, "配置文件损坏且无可用备份",
+                            "DeepSeek 崩溃原因：{}\n\n"
+                            "profile 的 cordis.patch.yml 已损坏，且同目录里找不到"
+                            "可用的 bak-* 备份。\n"
+                            "请从 D:\\dsh-backup 或版本点里取一份补上再重启；"
+                            "各 profile 的明细可用 `python modules\\patch_guard.py --check` 查。".format(
+                                _reason))
+                        self._rollback_count = 0
+                        return
+                    if _cat == "host_startup":
+                        # 宿主在启动阶段自己停了（11-18 07:16 那次：
+                        # host stopped + "did not exit after SIGKILL"）。
+                        # 这类多半是上次换版/换补丁残留的状态机（D:\DeepSeek\resources
+                        # 下的 app.asar.rename-pending / app.asar.purge-handoff.json），
+                        # 重试一次通常就过；10 分钟内重复才轮到快照回滚。
+                        import time as _time
+                        _last = getattr(self, "_host_retry_ts", 0.0)
+                        if _time.time() - _last > 600:
+                            self._host_retry_ts = _time.time()
+                            ZeroFallLogger.info("[崩溃自愈] 宿主启动期退出，先原样重试一次")
+                            QTimer.singleShot(3000, self.auto_launch_deepseek)
+                            return
+                        ZeroFallLogger.warning(
+                            "[崩溃自愈] 10 分钟内第二次宿主启动即退，转快照回滚 | {}".format(_reason))
+                    if _cat == "runtime_error":
+                        # 渲染进程硬崩（日志里连 error 级控制台输出都没有）：
+                        # 和插件、配置都无关，回滚快照只会把好的改动一起带回旧版本。
+                        # 唯一的进展方向是"现场"：把崩溃当刻的进程/显存/GPU 固定下来。
+                        try:
+                            from modules.crash_dump import collect as _collect_dump
+                            _dump = _collect_dump(
+                                getattr(self.config, "dsh_appdata_dir", "") or "",
+                                category=_cat, reason=_reason)
+                        except Exception:          # noqa: BLE001 - 采现场不许影响主流程
+                            _dump = {}
+                        _dump_dir = (_dump or {}).get("dir", "")
+                        _dump_line = ("\n现场已采集：{}\n".format(_dump_dir) if _dump_dir else "\n")
+                        _ret = QMessageBox.question(
+                            self, "渲染进程崩溃",
+                            "DeepSeek 崩溃原因：{}\n\n"
+                            "这类崩溃和插件、配置无关（渲染进程直接退出，"
+                            "日志里没有 JS 报错）。\n"
+                            "回滚快照无效，建议直接重启；若同一台机器反复出现，"
+                            "可用 ZF_WATCH_RENDERER=1 让 ZeroFall 带 --disable-gpu 启动对照。{}"
+                            "\n是否现在重启 DeepSeek？".format(_reason, _dump_line),
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.Yes)
+                        if _ret == QMessageBox.StandardButton.Yes:
+                            ZeroFallLogger.info("[崩溃自愈] 渲染进程崩溃，原样重启")
+                            QTimer.singleShot(1500, self.auto_launch_deepseek)
+                        else:
+                            ZeroFallLogger.info("[崩溃自愈] 保留现场，未重启")
                         return
             except Exception as _e:
                 ZeroFallLogger.warning("[崩溃分类] 失败，按通用流程处理: {}".format(_e))
@@ -4509,9 +4680,43 @@ class ZeroFallMainWindow(QMainWindow):
                     pass
                 return
         
+        if getattr(self, "_exit_requested", False):
+            return
+        self._exit_requested = True
         ZeroFallLogger.info("DeepSeek 已退出 (退出码: {})，ZeroFall 跟随关闭".format(exit_code))
         # 真正退出进程（不能只 close()，setQuitOnLastWindowClosed(False) 会让窗口关掉但进程驻留托盘）
-        QTimer.singleShot(1500, QApplication.quit)
+        # 这个槽已经由 _sig_deepseek_exit 排队到 GUI 线程，QTimer 能正常触发；
+        # 再挂一个看门狗：quit 被后台线程/清理流程拖住时 15 秒硬退，
+        # 否则就回到 2026-11-18 那个"日志说关了、窗口却留在桌面上"的状态。
+        QTimer.singleShot(1500, self._quit_app_now)
+
+    def _quit_app_now(self):
+        """在 GUI 线程里真正退出应用（带硬超时兜底）"""
+        ZeroFallLogger.info("ZeroFall 退出流程开始")
+        try:
+            if getattr(self, "tray_icon", None) is not None:
+                try:
+                    self.tray_icon.hide()
+                except Exception:
+                    pass
+            self._unregister_global_hotkey()
+        except Exception as _e:
+            ZeroFallLogger.warning("退出前清理失败（忽略）: {}".format(_e))
+
+        def _force_exit():
+            try:
+                ZeroFallLogger.warning("退出超时，强制结束进程")
+            except Exception:
+                pass
+            os._exit(0)
+
+        try:
+            # 正在写快照时多给点时间，别把半份包腰斩在盘上；其余情况 15 秒硬退
+            _timeout = 120.0 if getattr(self, "_snapshot_busy", False) else 15.0
+            threading.Timer(_timeout, _force_exit).start()
+        except Exception:
+            pass
+        QApplication.quit()
     
     def _on_tray_exit(self):
         """托盘退出"""

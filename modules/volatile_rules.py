@@ -29,6 +29,9 @@ HEARTBEAT_FILE_NAMES = (
     'relay-status.json',              # nightly/中继状态
     'last-boot.json',                 # guardian/state 启动时间戳
     'dsh-windows-mcp.versions.json',  # windows-mcp 版本探测结果
+    # 2026-11-18 实测：媒体/QQ 的会话清单是 2 字节的 `{}`，DSH 每次启动重写一遍；
+    # 内容永远一样，只有 mtime 换新 —— 不排掉就是"每开一次 DSH 一次假变更"。
+    'chat-sessions.json',
 )
 
 # 指纹层面额外排除：浏览器运行时转储与统计库（只看名字）
@@ -37,12 +40,29 @@ FINGERPRINT_EXTRA_FILE_PATTERNS = HEARTBEAT_FILE_NAMES + (
     'load_statistics.db*',
     'topTraffic_*',          # SmartScreen 远程信誉数据
     'crashpadmetrics*',
+    # 天工账本的上一版（~/.dsh/tiangong-state.json.prev）：状态每存一次就重写，
+    # 主文件被 `*state.json` 排掉了，带 .prev 后缀的这个漏在指纹里，
+    # 2026-11-18 实测 09:55 / 10:12 两次差异条目第一条都是它。
+    '*state.json.prev',
 )
 
 # 指纹层面额外排除：整棵子树（相对 .dsh 根）
 FINGERPRINT_EXTRA_REL_PREFIXES = (
     'nightly/relay-logs/',
     'douyin-browser/cli-profile/',   # Chromium profile：每开一次窗就动
+    # 2026-11-17 实测：守卫的 state 目录是"记账本"，不是插件环境。
+    # 里面 live-port.json / session-scan-cache.json 每跑一次 `guardian doctor` 就刷新，
+    # shadow.jsonl / flip.jsonl / boots.jsonl 每跑一次就开始追一行 ——
+    # 而 ZeroFall 把整个 `.dsh` 当插件目录盯着，于是"验一次守卫 = 拍一份 48MB 快照"。
+    # 当天日志证据：21:40 与 21:43 两次差异条目只有
+    # `plugins|guardian/state/live-port.json`，两次各产一份快照。
+    # 只影响指纹/MD5 判定，快照内容照样包含它们（真回退时这些账本也有用）。
+    'guardian/state/',
+    # 2026-11-18 改名后账本搬到 tianheng/state/，旧规则没跟着搬：
+    # shadow.jsonl 每几秒追一行、boots.jsonl 每次启动写一行、baseline/inventory
+    # 随自检刷新 —— 当日日志里 09:55、10:12 两次"变更点快照"的差异条目
+    # 都含 `plugins|tianheng/state/*`，等于每次自检都白拍一份 15MB。
+    'tianheng/state/',
 )
 
 # ── 快照层面：不值得进包的运行时垃圾（内容恢复出来也没用） ──

@@ -452,6 +452,53 @@ def check_dsh_profile():
         print('  提示：先按每项后面的「→」修掉，再重启 DSH')
 
 
+def check_patch_files():
+    """[11] 补丁文件能不能被宿主解析
+
+    2026-11-17 三次 host fatal 全是它：`YAMLException: null byte is not allowed
+    in input (1:1)`，宿主在 parsePatchList 直接退出，界面上看起来像"什么都没
+    发生"，日志里只有一个 exit!=0。这一项只读，不改任何文件；要修跑
+    `python modules/patch_guard.py --repair`（或直接点 ZeroFall 的启动，那边
+    拉起 DSH 之前会自动修）。
+    """
+    print('\n[11] 检查补丁文件可解析性')
+    try:
+        from modules import patch_guard as pg
+    except Exception as e:  # 模块坏了不该拖死整个自检
+        print('  [SKIP] 无法加载 patch_guard：{}'.format(e))
+        return
+
+    home = Path(os.environ.get('DSH_HOME') or (Path.home() / '.dsh'))
+    root = home / 'profiles'
+    if not root.is_dir():
+        print('  [SKIP] 本机没有 DSH profile 目录（{}）'.format(root))
+        return
+
+    rows = []
+    for pdir in sorted(p for p in root.iterdir() if p.is_dir()):
+        target = pdir / pg.TARGET_NAME
+        if not target.exists():
+            continue
+        ok, reason = pg.inspect_file(target)
+        rows.append((pdir.name, ok, reason, pg.find_good_backups(pdir)))
+
+    bad = [r for r in rows if not r[1]]
+    if not bad:
+        PASS.append('patch-files')
+        print('  [PASS] {} 份补丁文件都能被宿主解析'.format(len(rows)))
+        return
+
+    for name, _ok, reason, backups in bad:
+        if backups:
+            WARN.append('patch {}: {}'.format(name, reason))
+            print('  [WARN] {:<16} {}'.format(name, reason))
+            print('         → 有 {} 份完好备份可修：python modules\\patch_guard.py --repair'.format(
+                len(backups)))
+        else:
+            FAIL.append('patch {}: {}'.format(name, reason))
+            print('  [FAIL] {:<16} {}，且同目录没有可用备份'.format(name, reason))
+
+
 if __name__ == '__main__':
     print('=' * 70)
     print('ZeroFall 项目自检')
@@ -466,6 +513,7 @@ if __name__ == '__main__':
     check_version_consistency()
     check_config_duplication()
     check_dsh_profile()
+    check_patch_files()
     print()
     print('=' * 70)
     print('通过 {} / 提示 {} / 失败 {}'.format(len(PASS), len(WARN), len(FAIL)))

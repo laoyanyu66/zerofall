@@ -23,11 +23,12 @@ ZeroFall 在这里负责三件事（都在 DSH 进程外，纯文件 + 可选 HT
    其余 idle 的历史会话永远不出现在这里的候选里 —— 与插件侧语义保持一致，避免
    "一重启把所有会话都拉起来"。
 
-插件侧的崩溃防护（`boot.restoring` + 崩溃计数 + `maxSessions: 1` + 8MB 日志上限）
-保证它自己不会把 host 拖死；ZeroFall 只负责"让它还在、让它被看见"。
+插件侧的崩溃防护（`boot.restoring` + 崩溃计数 + `maxSessions: 2` + 8MB 日志上限 +
+`skipSubagent` 子会话让位）保证它自己不会把 host 拖死；ZeroFall 只负责"让它还在、让它被看见"。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -43,6 +44,18 @@ PLUGIN_NAME = "dsh-resume-sessions"
 PLUGIN_ID = "resume-sessions"
 PLUGIN_DEP = f"file:./vendor/{PLUGIN_NAME}"
 STATE_FILE = "resume-sessions.json"
+
+#: vendor 里记录"这份 index.js 是原样从内置 payload 拷过来的"的哈希标记。
+#: 有它才能区分"没人动过的拷贝"（可以升级）和"本地改过的版本"（必须保留）。
+_PAYLOAD_MARKER = ".zf-payload.sha256"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 #: 插件运行时需要的 host 包（拿它的 createUserMessage 构造续跑消息）
 DEFAULT_HOST_LLM = Path(r"D:\DeepSeek\resources\app\dsh\node_modules\@deepseek-ai\dsh-llm")
@@ -62,7 +75,9 @@ PATCH_BLOCK = """\
 #
 # 不做什么：idle 的历史会话永远不会被拉起来（force 手动补跑也只重试上次那批）。
 # 崩溃防护：
-#   maxSessions 8      —— 一次最多恢复 8 个（旧默认 2，会让"关之前开了 5 个"只接上 2 个）；
+#   maxSessions 2      —— 一次最多恢复 2 个（11-17 从 8 收回：8 会让"关之前开 8 个"
+#                        开机并发 8 条，观感就是好几条同题会话同时在跑）；
+#   skipSubagent true  —— 父会话也在候选里时，子会话不占名额（与插件同口径）；
 #   maxSessionLogMB 8  —— 单会话日志上限；maxTotalLogMB 64 —— 本轮累计上限；
 #   continueOnlyFirst false —— 每个恢复上来的会话都真的续跑（仍串行，不并发压模型）；
 #   anyWorkspace true  —— 跨工作区也恢复：「关之前在跑」跟在哪个工作区无关；
@@ -79,7 +94,7 @@ PATCH_BLOCK = """\
         startupDelayMs: 500
         resumeTimeoutMs: 90000
         maxAgeHours: 48
-        maxSessions: 8
+        maxSessions: 2
         runningWindowMin: 15
         resumeGapMs: 2500
         maxSessionLogMB: 8
@@ -88,6 +103,7 @@ PATCH_BLOCK = """\
         anyWorkspace: true
         includeGoalActive: true
         rearmGoals: true
+        skipSubagent: true
         verbose: true
 """
 
@@ -201,6 +217,16 @@ def ensure_entry(text: str) -> Tuple[str, str]:
     """保证 patch 里有这条 insert 且启用。返回 (新文本, 动作)。"""
     state = entry_state(text)
     if state == "missing":
+        # 空文档占位符必须**替换**掉，不能往后追加：
+        # 往 `[]` 后面接块状序列会得到
+        #     []
+        #     - insert:
+        # 两个文档头，宿主 parsePatchList 直接 fatal（YAML: expected
+        # '<document start>', but found '<block sequence start>'）。
+        # 之前这里是无脑 text + block，只在 patch 非空的机器上侥幸没炸。
+        body = _strip_empty_flow_list(text)
+        if body is not None:
+            return body + ("\n" if body and not body.endswith("\n") else "") + PATCH_BLOCK, "inserted"
         sep = "" if text.endswith("\n") or text == "" else "\n"
         return text + sep + ("\n" if text.strip() else "") + PATCH_BLOCK, "inserted"
     if state == "disabled":
@@ -208,18 +234,47 @@ def ensure_entry(text: str) -> Tuple[str, str]:
     return text, "unchanged"
 
 
+def _strip_empty_flow_list(text: str) -> Optional[str]:
+    """把「只有注释 + `[]` 占位」的 patch 摘成只剩注释骨架。
+
+    命中就返回"去掉占位符后的文本"（保留注释、以空行结尾），
+    没命中（说明是真有内容）返回 None，让调用方走原来的追加逻辑。
+    """
+    lines = text.splitlines()
+    idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s in ("[]", "{}"):
+            idx = i
+            break
+        return None                      # 首个有效行不是空集合 → 有真内容
+    if idx is None:
+        return None
+    keep = [ln for i, ln in enumerate(lines) if i != idx]
+    while keep and not keep[-1].strip():
+        keep.pop()
+    return "\n".join(keep).rstrip() + "\n" if keep else ""
+
+
 #: "多会话一起续跑"的基线阈值。
 #:
 #: 为什么要在每次启动时纠回：profile 被重置成模板 / 重装 / 从旧备份还原，都会把它们
-#: 带回老默认（maxSessions 2 + continueOnlyFirst true），表现就是"关之前开了 5 个会话，
-#: 重启只接着跑 1 个" —— 而这种降级是静默发生的，人只会觉得"这功能时好时坏"。
+#: 带回老默认（maxSessions 8 + 未知的 skipSubagent），表现就是"关之前开了 5 个会话，
+#: 开机并发 5 条同题会话，观感就是任务混在一起" —— 而且这种降级是静默发生的。
+#:
+#: 11-17 修正：这张表自己就是"静默降级"的源头 —— 它的 maxSessions 还写 8，于是启动
+#: 4 秒后把 profile 里刚改好的 2 又纠回 8（日志"[会话续跑] 续跑阈值已纠回基线：maxSessions: 2 -> 8"）。
+#: 现在与插件默认、PATCH_BLOCK、profile 现役值对齐到 2，并补上 skipSubagent。
 RESUME_BASELINE = {
-    "maxSessions": "8",
+    "maxSessions": "2",
     "maxTotalLogMB": "64",
     "continueOnlyFirst": "false",
     "maxSessionLogMB": "8",
     "anyWorkspace": "true",
     "staleLiveAsInterrupted": "true",
+    "skipSubagent": "true",
 }
 
 
@@ -295,9 +350,37 @@ def _backup(path: Path, tag: str = "zf-resume") -> Optional[Path]:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_name(f"{path.name}.zf-tmp-{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    """原子写。必须固定 LF：Python 在 Windows 上默认把 "\\n" 翻成 "\\r\\n"，
+    而 cordis.patch.yml 是 DSH 生成的 LF 文件 —— 一改成 CRLF，tools/switch.ps1 里
+    `^(\\s+)key: (true|false|shadow)($|[ \\t])` 这种"行尾断言"就匹配不到（\\r 既不是
+    行尾也不是空格），报"配置里没有 radar 这一行"。11-17 实际踩到过。
+
+    2026-11-18 起改走 modules/patch_io：跨进程锁 + 写后回读比对 + patch.yml 结构校验。
+    校验不过时 patch_io 会把写前内容回滚回去，然后抛 WriteVerificationError ——
+    宁可这次改动不生效，也不能给宿主留一份解析不了的 overlay。
+    """
+    validator = None
+    if path.name == "cordis.patch.yml":
+        try:
+            from modules.patch_guard import inspect_bytes as validator
+        except ImportError:                 # 脚本方式直接跑
+            from patch_guard import inspect_bytes as validator
+    try:
+        from modules.patch_io import atomic_write_text
+    except ImportError:
+        from patch_io import atomic_write_text
+    atomic_write_text(path, text, validator=validator)
+
+
+def _try_write(path: Path, text: str, report: Dict[str, Any]) -> bool:
+    """写失败只记账，不中断 repair —— 少改一处配置，比让整轮修复崩掉强。"""
+    try:
+        _atomic_write(path, text)
+        return True
+    except Exception as exc:                # noqa: BLE001 - 含 WriteVerificationError
+        report["warnings"].append(
+            "{} 写入未通过校验，已保持原内容：{}".format(path.name, exc))
+        return False
 
 
 def make_link(link: Path, target: Path) -> bool:
@@ -393,20 +476,34 @@ def ensure_plugin(home: Path, profile: str = "desktop", *,
 
     # 1. vendor 源码
     #
-    # 判据不能只看"大小不同"：内置 payload 是打包那一刻的快照，本地若先修过
-    # vendor（比如 2026-11-12 补的「恢复要挂 agent preset」），大小必然和 payload
-    # 不同，只比大小就会用旧 payload 把本地修复覆盖回去——而且是在启动 4 秒后
-    # 静默发生，人根本看不见。所以：vendor 比 payload 新就以 vendor 为准。
+    # 判据不能看 mtime：打包版里内置 payload 每轮都解包到临时目录，mtime 永远是"刚才"，
+    # 于是"vendor 比 payload 新"这条永远不成立。11-17 实测：装了新 exe 一启动就把
+    # vendor 里当天补的 sessionLineage / skipSubagent 覆盖回 11-14 的旧版，日志只有
+    # 一行"已复制插件源码到 vendor/"，人根本注意不到。
+    # 改成哈希对账：复制 payload 时把它的 sha256 记在 vendor/.zf-payload.sha256；
+    #   · vendor 与 payload 相同        → 什么都不做
+    #   · vendor 等于上次拷贝的哈希     → 说明没人改过，可以安全升级到新 payload
+    #   · vendor 与两者都不同           → 本地改过，保留不覆盖，只警告"要固化请重新打包"
     vendor = pdir / "vendor" / PLUGIN_NAME
     need_copy = force or not (vendor / "index.js").is_file()
-    vendor_newer = False
+    vendor_edited = False
     if not need_copy:
+        marker = vendor / _PAYLOAD_MARKER
         try:
-            vendor_stat = (vendor / "index.js").stat()
-            src_stat = (src / "index.js").stat()
-            if vendor_stat.st_size != src_stat.st_size:
-                vendor_newer = vendor_stat.st_mtime > src_stat.st_mtime
-                need_copy = not vendor_newer
+            vendor_hash = _sha256_file(vendor / "index.js")
+            src_hash = _sha256_file(src / "index.js")
+            copied_hash = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+            if vendor_hash == src_hash:
+                # 已一致：补记一次"这是原样拷贝"，下次 payload 换版才能安全采纳
+                try:
+                    if not marker.is_file():
+                        marker.write_text(src_hash, encoding="utf-8")
+                except OSError:
+                    pass
+            elif copied_hash and vendor_hash == copied_hash:
+                need_copy = True                         # 原样拷贝，可安全换代
+            else:
+                vendor_edited = True                     # 本地改过，保留
         except OSError:
             need_copy = True
     if need_copy:
@@ -415,11 +512,16 @@ def ensure_plugin(home: Path, profile: str = "desktop", *,
             s = src / name
             if s.is_file():
                 shutil.copy2(s, vendor / name)
+        try:
+            (vendor / _PAYLOAD_MARKER).write_text(
+                _sha256_file(src / "index.js"), encoding="utf-8")
+        except OSError:
+            pass
         report["actions"].append("已复制插件源码到 vendor/")
-    elif vendor_newer:
+    elif vendor_edited:
         report["warnings"].append(
-            "vendor/ 的插件比内置 payload 新，保留 vendor（不覆盖本地修复）；"
-            "要固化进 exe 请重新打包"
+            "vendor/ 的插件与内置 payload 不同（本地改过），保留 vendor 不覆盖；"
+            "要固化进 exe 请把这份源码放回 modules/payload 后重新打包"
         )
 
     # 2. 依赖声明
@@ -433,8 +535,8 @@ def ensure_plugin(home: Path, profile: str = "desktop", *,
     if deps.get(PLUGIN_NAME) != PLUGIN_DEP:
         _backup(pkg_path)
         deps[PLUGIN_NAME] = PLUGIN_DEP
-        _atomic_write(pkg_path, json.dumps(pkg, ensure_ascii=False, indent=2) + "\n")
-        report["actions"].append("package.json 已声明依赖")
+        if _try_write(pkg_path, json.dumps(pkg, ensure_ascii=False, indent=2) + "\n", report):
+            report["actions"].append("package.json 已声明依赖")
 
     # 3. node_modules 链接
     link = pdir / "node_modules" / PLUGIN_NAME
@@ -457,8 +559,8 @@ def ensure_plugin(home: Path, profile: str = "desktop", *,
     new_text, action = ensure_entry(text)
     if action != "unchanged":
         _backup(patch, "zf-resume")
-        _atomic_write(patch, new_text)
-        report["actions"].append({"inserted": "patch 已插入插件条目", "enabled": "patch 里已把插件改回 enabled: true"}[action])
+        if _try_write(patch, new_text, report):
+            report["actions"].append({"inserted": "patch 已插入插件条目", "enabled": "patch 里已把插件改回 enabled: true"}[action])
 
     # 阈值纠回基线：maxSessions / continueOnlyFirst 被改回老默认时，
     # 表现就是"多个会话只续跑一个"，而且不会有任何提示 —— 必须每次都看一眼。
@@ -466,9 +568,9 @@ def ensure_plugin(home: Path, profile: str = "desktop", *,
     if thr_actions:
         if action == "unchanged":
             _backup(patch, "zf-resume")
-        _atomic_write(patch, fixed_text)
-        report["actions"].append(
-            "续跑阈值已纠回基线：" + "，".join(thr_actions))
+        if _try_write(patch, fixed_text, report):
+            report["actions"].append(
+                "续跑阈值已纠回基线：" + "，".join(thr_actions))
 
     report["status"] = plugin_status(pdir)
     if not report["status"]["ready"] and not report["errors"]:
@@ -559,6 +661,52 @@ def session_log_bytes(home: Path, session_id: str) -> int:
     except OSError:
         return 0
     return total
+
+
+def _session_dir_file(home: Path, session_id: str) -> Optional[Path]:
+    """找会话日志文件：`sessions/<workspace>/<session-id>/session.v4.jsonl.zstd`。"""
+    root = Path(home) / "sessions"
+    try:
+        for workspace in root.iterdir():
+            if not workspace.is_dir():
+                continue
+            f = workspace / session_id / "session.v4.jsonl.zstd"
+            if f.is_file():
+                return f
+    except OSError:
+        return None
+    return None
+
+
+def session_lineage(home: Path, session_id: str, node: Optional[str] = None,
+                    cache: Optional[Dict[str, Tuple[str, str]]] = None) -> Tuple[str, str]:
+    """(origin, parentSession)。只解会话日志第一帧 —— 与插件的 sessionLineage() 同口径。
+
+    解不出来一律返回 ("", "")：老版本 exe 里没有 head 模式时会抛错，
+    这里吞掉并当作"不是子会话"，宁可多显示一条，也不要凭空藏会话。
+    """
+    if cache is not None and session_id in cache:
+        return cache[session_id]
+    result: Tuple[str, str] = ("", "")
+    f = _session_dir_file(home, session_id)
+    if f is not None:
+        try:
+            from . import session_repair
+            node = node or session_repair.find_node(str(Path(home)))
+            if node:
+                head = session_repair._run(node, ["head", str(f)], timeout=30)
+                result = (str(head.get("origin") or ""), str(head.get("parentSession") or ""))
+        except Exception:
+            result = ("", "")
+    if cache is not None:
+        cache[session_id] = result
+    return result
+
+
+def _bare_sid(sid: str) -> str:
+    """`session-<uuid>` 与裸 uuid 是同一件事，比较前先归一（插件侧 formsOf 的等价做法）。"""
+    sid = str(sid or "")
+    return sid[len("session-"):] if sid.startswith("session-") else sid
 
 
 def _parse_scalar(text: str) -> Any:
@@ -711,6 +859,7 @@ def pending_sessions(home: Path, include_idle: bool = False,
       - 归档掉的（archivedSessionIds）不算；
       - 超过 maxAgeHours 保质期的不算；
       - 不在插件当前工作区的不算；
+      - 父会话也在候选里时，子会话让位（skipSubagent，默认开）；
       - 真正会恢复的只有名额内的前 maxSessions 个（按 runningAt 倒序）。
 
     include_idle=True：连已结束的一起返回，页签用它 —— 否则列表一空，
@@ -792,11 +941,29 @@ def pending_sessions(home: Path, include_idle: bool = False,
             "blank": blank,
             "log_mb": round(session_log_bytes(home, sid) / (1024 * 1024), 1),
             "candidate": candidate,
+            "subagent": False,
+            "skipped_subagent": False,
             "will_restore": False,
             "will_continue": False,
         })
     # 插件的排序：runningAt 倒序（没有就退回 at）。
     rows.sort(key=lambda r: (r["running_at"] or r["at"] or 0), reverse=True)
+    # 子会话让位：父会话也在候选里时，子会话不占名额（插件 skipSubagent 的同一口径）。
+    # 不这么做，面板会说"要恢复 2 条"，插件实际只动 1 条 —— 读数和行为对不上。
+    if cfg.get("skipSubagent", True) is not False:
+        cand_rows = [r for r in rows if r["candidate"]]
+        lineage_cache: Dict[str, Tuple[str, str]] = {}
+        parent_of: Dict[str, str] = {}
+        for r in cand_rows:
+            origin, parent = session_lineage(home, r["session_id"], cache=lineage_cache)
+            r["subagent"] = bool(origin == "subagent" or parent)
+            parent_of[r["session_id"]] = parent
+        cand_bare = {_bare_sid(r["session_id"]) for r in cand_rows}
+        for r in cand_rows:
+            parent = parent_of.get(r["session_id"]) or ""
+            if parent and _bare_sid(parent) in cand_bare:
+                r["candidate"] = False
+                r["skipped_subagent"] = True
     # 名额：只有排在前 max_sessions 的候选才是"下次真的会被恢复"。
     picked = [r for r in rows if r["candidate"]][:max_sessions] if max_sessions > 0 else []
     picked_ids = {r["session_id"] for r in picked}

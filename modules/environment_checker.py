@@ -127,6 +127,20 @@ def _is_excluded_rel(rel: str) -> bool:
     r = str(rel or '').replace('\\', '/').lstrip('./')
     return any(r.startswith(p) for p in MD5_EXCLUDE_REL_PREFIXES)
 
+# 宿主"原样重写"的配置文件：指纹用内容哈希，不用 mtime
+#
+# 2026-11-18 实测：DSH 每次启动都会重写 profiles/desktop/cordis.patch.yml，
+# 字节完全一样（42375 → 42375），只有 mtime 换新。快指纹是 (路径, mtime, 大小)，
+# 于是"开一次 DSH"就算一次插件改动 —— 当天 08:59 / 09:31 / 09:55 / 10:12
+# 四条差异日志的第一条都是它，每条后面跟一份 15 MB 变更点快照。
+#
+# 不能整份排除：这是真正的配置，改了就必须被拍到。所以只换"判据"：
+# 命中的文件读一遍内容算 sha1（这份 42 KB，一分钟一次可忽略），
+# 内容真变了指纹才变。读不出来时退回 mtime，宁可多拍一份也不漏改动。
+CONTENT_HASH_FILE_NAMES = (
+    'cordis.patch.yml',
+)
+
 class CheckResult(Enum):
     """校验结果枚举"""
     PASSED = "passed"
@@ -194,12 +208,16 @@ class EnvironmentChecker:
             ZeroFallLogger.error(f"保存环境状态失败: {e}")
     
     def quick_fingerprint(self):
-        """插件/配置目录的廉价指纹：只用 stat，不读文件内容
+        """插件/配置目录的廉价指纹：主用 stat，少数"宿主原样重写"的文件用内容哈希
 
         为什么要它：判断"环境有没有被改动"如果用整套 MD5，
         插件目录几百个文件、上百 MB，60 秒轮询一次会明显吃 IO 和 CPU。
         这里只取 (相对路径, 修改时间, 大小) 做哈希 —— 几百次 stat 通常
         几十毫秒，完全可以每分钟跑。
+
+        例外是 CONTENT_HASH_FILE_NAMES 里的几个（目前只有 cordis.patch.yml）：
+        宿主每次启动都会原样重写它们，mtime 天天变、内容不变，用 stat 判据
+        等于每次重启都拍一份快照。这几个文件读内容算 sha1，只有内容真变才变指纹。
 
         排除规则和 MD5 校验保持一致：日志、会话、缓存这些天然会变的
         目录/文件不算"改动"，否则一分钟一个快照。
@@ -242,8 +260,16 @@ class EnvironmentChecker:
                         except Exception:
                             continue
                         rel = str(fp.relative_to(root)).replace('\\', '/')
-                        parts.append('{}|{}|{}|{}'.format(
-                            key, rel, int(st.st_mtime), st.st_size))
+                        if low in CONTENT_HASH_FILE_NAMES:
+                            try:
+                                sig = 'sha1:' + _hl.sha1(fp.read_bytes()).hexdigest()
+                            except Exception:
+                                sig = 'mtime:{}'.format(int(st.st_mtime))
+                            parts.append('{}|{}|{}|{}'.format(
+                                key, rel, sig, st.st_size))
+                        else:
+                            parts.append('{}|{}|{}|{}'.format(
+                                key, rel, int(st.st_mtime), st.st_size))
             except Exception as e:
                 parts.append('{}:error:{}'.format(key, e))
 

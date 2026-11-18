@@ -167,12 +167,46 @@ function rewrite(src, dst, opts) {
   };
 }
 
+function head(file) {
+  // 只解第一帧的会话头：判断 origin / parentSession（子会话让位要用），不解全文。
+  const buf = fs.readFileSync(file);
+  const frames = walkFrames(buf);
+  const first = frames.find((f) => !f.skippable);
+  if (!first) return { error: "没有可解帧" };
+  const text = zlib.zstdDecompressSync(buf.subarray(first.start, first.end)).toString("utf8");
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    try {
+      const o = JSON.parse(line);
+      if (o && typeof o === "object") {
+        return {
+          type: o.type ?? "",
+          origin: o.origin ?? (o.data && o.data.origin) ?? "",
+          parentSession: o.parentSession ?? (o.data && o.data.parentSession) ?? "",
+          id: o.id ?? (o.data && o.data.id) ?? "",
+          title: o.title ?? (o.data && o.data.title) ?? "",
+        };
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+  return { error: "第一帧里没有可解析的 JSON" };
+}
+
 function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   try {
     if (cmd === "stats") {
       const out = stats(rest[0]);
       process.stdout.write(JSON.stringify(out) + "\n");
+      return;
+    }
+    if (cmd === "head") {
+      const out = head(rest[0]);
+      process.stdout.write(JSON.stringify(out) + "\n");
+      if (out.error) process.exitCode = 1;
       return;
     }
     if (cmd === "rewrite") {
@@ -182,7 +216,7 @@ function main() {
       process.stdout.write(JSON.stringify(out) + "\n");
       return;
     }
-    throw new Error("用法：stats <file> | rewrite <src> <dst> [--dedupe-seq]");
+    throw new Error("用法：stats <file> | head <file> | rewrite <src> <dst> [--dedupe-seq]");
   } catch (e) {
     process.stdout.write(JSON.stringify({ error: String(e.message || e) }) + "\n");
     process.exit(1);

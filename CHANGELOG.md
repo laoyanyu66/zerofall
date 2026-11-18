@@ -11,8 +11,87 @@
 
 ## [未发布]
 
+### 变更
+
+- **变更点快照打完后立刻刷新静默快照的比对基准（2026-11-18 自检）**：日志实证
+  `10:13:26` 变更点快照之后 `10:14:26` 又拍一份静默快照、`12:39:44` 之后
+  `12:41:44` 又一份 —— 间隔 1–2 分钟、各 37 MB，内容几乎一样。
+  原因是 `_last_light_fingerprint` 只在静默快照成功后更新，变更点快照打完
+  基准还停在"改动前"，下一轮定时快照自然认为"内容变了"。
+  新增 `_mark_light_baseline(fingerprint)`，变更点快照成功后把基准同步成
+  `_create_drift_snapshot(fp)` 传进来的改动后指纹；定时静默路径也统一走它。
+- **变更检测的噪声清单补齐到"改名后的账本"（2026-11-18 自检）**：当日日志四条
+  `[变更检测] 差异前 6 条` 里，除了 `profiles/desktop/cordis.patch.yml`，反复出现的
+  还有 `tiangong-state.json.prev`、`tianheng/state/baseline.json`、
+  `media/onebot/chat-sessions.json`。这些都不是插件环境：
+  · `tianheng/state/` —— 守卫改名后的账本目录，`shadow.jsonl` 每几秒追一行、
+    `boots.jsonl` 每次启动写一行。旧规则只排了 `guardian/state/`，改名后等于失效，
+    09:55 / 10:12 两次变更点快照都是它换来的；
+  · `*state.json.prev` —— 天工账本的上一版，主文件被 `*state.json` 排掉、带 `.prev`
+    的漏在指纹里；
+  · `chat-sessions.json` —— 2 字节的 `{}`，DSH 每次启动重写一遍。
+  三条都已进 `volatile_rules.py`：只影响指纹/MD5 判定，快照内容照样包含它们。
+- **宿主"原样重写"的配置改用内容哈希判据（2026-11-18 自检）**：DSH 每次启动都会
+  重写 `profiles/desktop/cordis.patch.yml`，字节一样、只有 mtime 换新，而快指纹是
+  (路径, mtime, 大小) —— 等于"开一次 DSH = 一次插件改动 = 一份 15 MB 快照"。
+  新增 `CONTENT_HASH_FILE_NAMES`（目前只有这一份）：命中的文件读内容算 sha1，
+  内容真变了指纹才变；读不出来退回 mtime，宁可多拍一份也不漏改动。
+  指纹耗时实测 127 ms/次（966 个条目），60 秒轮询无压力。
+- **续跑口径对齐插件的「子会话让位」（2026-11-17）**：`dsh-resume-sessions` 新增
+  `skipSubagent`（父会话也在候选里时，子会话不占名额）。会话续跑页签的
+  `pending_sessions()` 现在也按同一口径过滤，并多出两个字段：`subagent`（这条是不是委派子会话）、
+  `skipped_subagent`（是不是因为父会话在场而让位）。此前页签会报"要恢复 N 条"，
+  插件实际只动更少的条目 —— 读数和行为对不上。
+- **内置的默认配置块同步到现役**：`PATCH_BLOCK` 的 `maxSessions` 由 8 收到 2，
+  并补上 `skipSubagent: true`。这一块是"profile 条目丢了就照它重新插回去"的模板，
+  模板比现役弱，等于在没人看见时把防护降级。
+- **内容没变的轻量快照不再产新包（2026-11-17）**：`create_snapshot()` 会给快照目录算一份
+  内容指纹（相对路径 + 文件内容，排序后 sha256，记在 `_zf_content_sigs.json`），
+  与上一份完全一致时直接回收临时目录并返回上一份快照。最初用的是"路径 + 大小 + mtime"，
+  但现成的 55 份快照里没有任何两份包级 md5 相同 —— 相隔几分钟，mtime 全变了而内容没变，
+  mtime 版几乎不会命中，所以改成按内容算。完整快照与"崩溃现场"不参与
+  ——前者是定时恢复点，后者不能和省体积做交易。实测环境里 58 份 ≈ 2.68 GB。
+- **自愈不再用旧 payload 覆盖本地修复（2026-11-17 实机踩到）**：换新 exe 后第一次启动，
+  日志出现「已复制插件源码到 vendor/」，把 vendor 里当天补的 `sessionLineage` /
+  `skipSubagent` 覆盖回 11-14 的旧版。根因是判据看 mtime —— 打包版里 payload 每轮解包到
+  临时目录，mtime 永远是"刚才"，"vendor 比 payload 新"永远不成立。改成哈希对账：
+  复制 payload 时把它的 sha256 记进 `vendor/.zf-payload.sha256`；vendor 与该值一致
+  （没人动过）才允许升级，改过就保留并警告"要固化请放回 modules/payload 重新打包"。
+  回归用例：`tests/test_resume_guard.py` 的 L 段（本地修复不被覆盖 / 原样拷贝能升级）。
+- **`_atomic_write` 固定 LF（2026-11-17 实机踩到）**：Python 在 Windows 上默认把 `\n`
+  翻成 `\r\n`，而 `cordis.patch.yml` 是 DSH 生成的 LF 文件。一旦整份变成 CRLF，
+  `tools/switch.ps1` 的行尾断言（`^(\s+)key: (true|false|shadow)($|[ \t])`）就匹配不到
+  —— 它报的是「配置里没有 radar 这一行」，看起来像配置丢了，其实是行尾。守卫 doctor
+  当场由 29/0 变 28/1。写入改用 `newline="\n"`，并把现役 patch 的行尾还原（内容逐行比对无差异）。
+- **`RESUME_BASELINE` 自己就是静默降级的源头（2026-11-17）**：这张"每次启动纠回阈值"的表
+  里 `maxSessions` 还写着 8，于是启动 4 秒后把 profile 里刚改好的 2 又纠回 8
+  （日志「续跑阈值已纠回基线：maxSessions: 2 -> 8」）。改为 2，并补 `skipSubagent: true`；
+  `ensure_thresholds` 按表遍历，新键自动纳入纠正范围。
+- **恢复完成后自动跑一次守卫自检（2026-11-17）**：`restore_snapshot()` 在
+  `_ensure_profile_deps()` 之后调用 `_post_restore_guardian_check()`，用 DSH 自带 node 跑
+  `guardian.mjs doctor` 与 `tidy`（干跑），把"共 N 项 / 通过 M · 失败 K / 待归档 X 条"写进
+  恢复日志。理由：完整恢复会把 `profiles`（守卫/续跑插件的修复）和 `storages`（归档集）
+  一起带回快照那天，回退到什么状态不该靠人自己想起来。
+- **守卫的记账本不再被当成"插件被改动"（2026-11-17 自检）**：`deepseek_plugins_dir` 是
+  整个 `.dsh`，而守卫的 `guardian/state/` 就在里面 —— `live-port.json` 每跑一次 `guardian doctor`
+  刷新、`shadow.jsonl` 每跑一次追一行。于是"验一次守卫 = 一次变更判定 + 静默快照"，
+  当天日志两次差异条目只有 `plugins|guardian/state/live-port.json`（21:40、21:43 各拍了一份）。
+  `volatile_rules.FINGERPRINT_EXTRA_REL_PREFIXES` 补 `guardian/state/`：只影响指纹/MD5 判定，
+  快照内容照样包含它们。回归用例：`tests/test_plugin_drift.py` 第 3 项新增两条断言。
+- **快照失败不再留半成品（2026-11-17 自检）**：`create_snapshot()` 的 `except` 只打了个日志
+  就返回，复制到一半的目录（几十 MB）和没写完的 zip 会留在快照目录里 —— 启动清理能扫到，
+  但那要等下次启动；运行期间反复失败就是白占空间。现在失败时清掉这两样，但只在
+  "索引里还没有这份快照"时清（索引已写入说明包是好的，报错在收尾步骤，那时删包等于丢快照）。
+
 ### 新增
 
+- **会话帧助手 `tools/session_zstd.cjs` 增加 `head <file>`**：只解第一帧，返回
+  `origin` / `parentSession` / `id` / `title`，供"子会话让位"判血缘用；解不出时返回
+  `{"error":…}` 并以退出码 1 结束，调用方按"不是子会话"降级处理，不会凭空藏会话。
+- **`tests/test_snapshot_identical_skip.py`**：跨快照去重的回归测试（跳过同内容轻量快照 /
+  内容变了照常产包 / 完整快照不跳过 / 崩溃快照不跳过），7 项。
+- **`_zf_content_sigs.json`**：快照内容指纹登记表，与 `D:\dsh备份\snapshot_index.json` 并列，
+  首次生成新快照时自动出现；删快照时对应条目一并清掉。
 - **崩溃「保留现场」后自动交给豆包**：dsh 崩溃且选择不回退快照（或已关自动回退、或多次回退后
   选择停手）时，自动做一次本机 GUI 接力 —— 拉起豆包 → `Ctrl+N` 新对话 → 粘贴
   「dsh又崩溃了，帮我分析一下是什么原因，并帮我修复优化一下」+ 现场信息（退出码 / 崩溃日志路径 /
@@ -52,6 +131,13 @@
 
 ### 测试
 
+- **回归用例跟上行为变化（2026-11-18 全量 sweep 抓到的两处红）**：
+  · `test_ui_panel_smoke.py` 的"同一秒建两份快照不撞 id"原先连着建两份完全相同的
+    快照，去重上线后第二份被正当地跳过，三条断言变红。改为第二份前先放一个
+    `marker.txt`，验的仍是"同秒两份**不同内容**不能撞 id"。
+  · `test_key_source_drift.py` 的"无 key 时不伪造"等 6 条会假失败：`load_credential_env()`
+    从 `dict(os.environ)` 起底，而本机环境里确实带着 `OPENCODE_GO_API_KEY`。
+    用例开始前暂存并清空所有 `*API_KEY*` / `*_TOKEN`，结束再恢复，与真实机器隔离。
 - 新增 `tests/test_snapshot_autorefresh.py`（17 项）：默认开启、无变化不重建、后台新增后自动出现、
   自动刷新保住选中行、强制刷新、关掉开关即停、重开立刻补一次。
 - 新增 `tests/test_snapshot_dedupe.py`（37 项）：同内容大文件只存一份、小文件与同尺寸异内容不误去重、

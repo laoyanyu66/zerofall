@@ -70,7 +70,13 @@ class Guardian:
             # 检查是否已经在运行
             if self.is_deepseek_running():
                 return False, "DeepSeek已在运行中"
-            
+
+            # 0) 补丁文件体检（2026-11-18 自检）
+            #    11-17 连踩三次：cordis.patch.yml 里混进 NUL / 被截断，宿主在
+            #    parsePatchList 里直接抛 DesktopHostFatalError，进程退出、面板起不来，
+            #    ZeroFall 侧只看到一个 exit!=0，看不出是文件坏了。这里先修再往下走。
+            self._guard_profile_patch()
+
             # 前置校验
             if not bypass_check:
                 success, report = self.pre_launch_check()
@@ -88,8 +94,16 @@ class Guardian:
                 from utils import sanitized_child_env
                 # 不把 PyInstaller onefile 的簿记变量漏给 DSH，
                 # 否则从 DSH 那条链再启动 ZeroFall 会撞父进程校验失败。
+                # 观测模式（可选）：ZF_WATCH_RENDERER=1 时追加 --disable-gpu。
+                # 12:38 那类 renderer 硬崩没有任何 JS 报错，只能用"关掉 GPU 再看
+                # 复现不复发"来分辨是不是硬件加速层。默认不注入 —— 不影响日常。
+                launch_args = [exe_path]
+                if self._renderer_watch_enabled():
+                    launch_args.append("--disable-gpu")
+                    ZeroFallLogger.warning(
+                        "观测模式：本次以 --disable-gpu 启动（ZF_WATCH_RENDERER=1）")
                 self.deepseek_process = subprocess.Popen(
-                    [exe_path], env=sanitized_child_env())
+                    launch_args, env=sanitized_child_env())
                 self._invalidate_running_cache()
 
                 ZeroFallLogger.deepseek_launched()
@@ -106,6 +120,47 @@ class Guardian:
                 ZeroFallLogger.error(f"启动DeepSeek失败: {e}")
                 return False, f"启动失败: {str(e)}"
     
+    def _renderer_watch_enabled(self) -> bool:
+        """观测模式开关：环境变量 ZF_WATCH_RENDERER=1 / true / on。
+
+        不放 config 字段，是因为 config 的每个字段都被 selfcheck 校验"必须被读取"，
+        加一个只在调试时用的开关会长期挂着一条无用配置。
+        """
+        raw = (os.environ.get("ZF_WATCH_RENDERER") or "").strip().lower()
+        return raw in ("1", "true", "on", "yes")
+
+    def _guard_profile_patch(self):
+        """启动前把坏掉的 cordis.patch.yml 换成最近的完好备份。
+
+        只查会让宿主 fatal 的形态（NUL / 空 / 截断 / YAML 解析失败），
+        修的时候一定会把坏文件留档成 `bak-invalid-*`；没有可用备份就只报警不动手。
+        任何异常都不阻断启动 —— 体检本身不该成为新的失败点。
+        """
+        try:
+            from modules.patch_guard import ensure as ensure_patch
+            home = self.config.deepseek_plugins_dir or ""
+            report = ensure_patch(home=Path(home) if home and Path(home).is_dir() else None)
+            for row in report.get("repaired", []):
+                ZeroFallLogger.warning(
+                    "补丁文件已自动修复（{}）：{} ← {}（坏文件留档 {}）".format(
+                        Path(row["profile"]).name, row["reason"],
+                        row["backup_used"], row["kept_bad"] or "-"))
+                # 时间线留痕：这类修复以前只写日志，出事后没人记得"哪天自己修过"
+                try:
+                    from modules.fault_timeline import record as _record
+                    _record("patch_repaired",
+                            "补丁文件已自动修复（{}）：{}".format(
+                                Path(row["profile"]).name, row["reason"]),
+                            backup=row["backup_used"], kept=row["kept_bad"] or None)
+                except Exception:
+                    pass
+            for row in report.get("bad", []):
+                ZeroFallLogger.error(
+                    "补丁文件异常且没有可用备份（{}）：{}，这次启动很可能失败".format(
+                        Path(row["profile"]).name, row["reason"]))
+        except Exception as e:
+            ZeroFallLogger.warning("补丁文件体检跳过（不影响启动）：{}".format(e))
+
     def _start_process_monitor(self):
         """启动进程监控线程"""
         self.running = True

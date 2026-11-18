@@ -86,8 +86,8 @@ class H:
         self._daily_full_busy = False
         self.made = []          # 记录打快照的调用
 
-    def _create_drift_snapshot(self):
-        self.made.append(time.time())
+    def _create_drift_snapshot(self, fingerprint=''):
+        self.made.append((time.time(), fingerprint))
 
 
 def test_fingerprint_cheap_and_stable():
@@ -124,6 +124,58 @@ def test_fingerprint_ignores_excluded():
     (plug / 'sessions' / 'session.jsonl').write_text('{}', encoding='utf-8')
     fp2 = ec.quick_fingerprint()
     check('写 .log 不改变指纹', fp1 == fp2, (fp1[:8], fp2[:8]))
+
+    # 守卫的 state 目录：doctor 每跑一次就刷新 live-port.json / 追一行 shadow.jsonl，
+    # 这些是"记账本"不是插件环境。不排掉就是"验一次守卫拍一份快照"
+    # （2026-11-17 实测日志里两次差异条目只有 guardian/state/live-port.json）。
+    (plug / 'guardian' / 'state').mkdir(parents=True, exist_ok=True)
+    (plug / 'guardian' / 'state' / 'live-port.json').write_text(
+        '{"pid": 1, "port": 19726}', encoding='utf-8')
+    (plug / 'guardian' / 'state' / 'shadow.jsonl').write_text('{"k":1}\n', encoding='utf-8')
+    fp3 = ec.quick_fingerprint()
+    check('guardian/state 写账本不改变指纹', fp2 == fp3, (fp2[:8], fp3[:8]))
+
+    # 改名后账本搬到 tianheng/state：新目录必须和旧目录同等待遇，
+    # 否则"自检一次 = 拍一份 15MB 快照"会在改名后全部复活
+    # （2026-11-18 实测差异条目里就有 plugins|tianheng/state/baseline.json）。
+    (plug / 'tianheng' / 'state').mkdir(parents=True, exist_ok=True)
+    (plug / 'tianheng' / 'state' / 'shadow.jsonl').write_text('{"k":2}\n', encoding='utf-8')
+    (plug / 'tianheng' / 'state' / 'baseline.json').write_text('{"b":1}', encoding='utf-8')
+    fp4 = ec.quick_fingerprint()
+    check('tianheng/state 写账本不改变指纹', fp3 == fp4, (fp3[:8], fp4[:8]))
+
+    # 两个"每次启动都被重写"的小文件：2 字节的 QQ 会话清单、天工账本的 .prev
+    (plug / 'media' / 'onebot').mkdir(parents=True, exist_ok=True)
+    (plug / 'media' / 'onebot' / 'chat-sessions.json').write_text('{}', encoding='utf-8')
+    (plug / 'tiangong-state.json.prev').write_text('{"s":1}', encoding='utf-8')
+    fp5 = ec.quick_fingerprint()
+    check('chat-sessions.json / state.json.prev 不改变指纹', fp4 == fp5, (fp4[:8], fp5[:8]))
+
+
+def test_fingerprint_content_hash_for_host_rewrite():
+    print('\n[3b] 宿主原样重写 cordis.patch.yml：只变 mtime 不算改动')
+    root, plug, cfg_dir = make_env()
+    patch = cfg_dir / 'cordis.patch.yml'
+    patch.write_text('a: 1\nb: 2\n', encoding='utf-8')
+    ec = make_checker(plug, cfg_dir)
+    fp1 = ec.quick_fingerprint()
+
+    # 内容不变、只把 mtime 推到未来（等价于宿主重新落一份同样的文件）
+    os.utime(patch, (time.time() + 60, time.time() + 60))
+    fp2 = ec.quick_fingerprint()
+    check('mtime 变、内容没变 → 指纹不变', fp1 == fp2, (fp1[:8], fp2[:8]))
+
+    # 真改了内容必须被发现（配置是真实改动，不能靠排除混过去）
+    patch.write_text('a: 1\nb: 3\n', encoding='utf-8')
+    fps = ec.quick_fingerprint()
+    check('内容变了 → 指纹变了', fp1 != fps, (fp1[:8], fps[:8]))
+
+    # 读不出来时退回 mtime 判据：宁可多拍一份，也不能漏掉改动
+    os.remove(patch)
+    patch.mkdir()
+    fpdir = ec.quick_fingerprint()
+    check('读不了（变成目录）不崩', bool(fpdir), fpdir[:8])
+
 
 
 def test_first_run_records_baseline_only():
@@ -214,6 +266,7 @@ if __name__ == '__main__':
     test_fingerprint_cheap_and_stable()
     test_fingerprint_changes_on_modify()
     test_fingerprint_ignores_excluded()
+    test_fingerprint_content_hash_for_host_rewrite()
     test_first_run_records_baseline_only()
     test_change_enters_pending_not_immediate()
     test_settled_then_snapshot()
